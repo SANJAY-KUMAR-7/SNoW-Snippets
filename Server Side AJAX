@@ -1,0 +1,339 @@
+var otisAjaxUtils = Class.create();
+otisAjaxUtils.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+    populateBankInfoVendor: function() {
+        var grVendorC = new GlideRecord('x_guklo_idot_vendor_case');
+        grVendorC.get(this.getParameter('sysparm_vendorcase'));
+        var grVendor = new GlideRecord('x_guklo_idot_vendors');
+        grVendor.get(grVendorC.vendor_name);
+        var grPayment = new GlideRecord('x_guklo_idot_supplier_payment_information');
+        grPayment.get(grVendor.payment_details);
+        var bank_account = grPayment.bank_account_no.getDecryptedValue();
+        var obj = {
+            "bank_name": grPayment.bank_name.toString(),
+            "bank_acc_number": bank_account.toString(),
+            "bank_country": grPayment.bank_country_code.toString(),
+            "swift": grPayment.swift_code.toString(),
+            "iban": grPayment.iban.toString(),
+            "transit_number": grPayment.bank_transit_no.toString(),
+        }
+        return JSON.stringify(obj);
+    },
+
+    getSupplierAdddress: function() {
+        var obj = {
+            main: null,
+            remit: null,
+            manufacturing: []
+        };
+        var grVendorAddress = new GlideRecord('x_guklo_idot_vendor_address');
+        grVendorAddress.addQuery('vendor.erp_supplier_id_for_new_supplier', this.getParameter('sysparm_vendor_erp_id'));
+        grVendorAddress.query();
+        while (grVendorAddress.next()) {
+            var addressObj = {
+                addressLine1: grVendorAddress.address_line_number_1.toString(),
+                addressLine2: grVendorAddress.address_line_number_2.toString(),
+                addressLine3: grVendorAddress.address_line_number_3.toString(),
+                addressLine4: grVendorAddress.address_line_number_4.toString(),
+                city: grVendorAddress.city.toString(),
+                state: grVendorAddress.state.toString(),
+                country: grVendorAddress.country.toString(),
+                zip: grVendorAddress.zip_code.toString(),
+                county: grVendorAddress.county_code.toString()
+            };
+            var addressType = grVendorAddress.address_type.toString();
+
+            if (addressType === 'HQ') {
+                obj.main = addressObj;
+
+            } else if (addressType === 'REMT') {
+                obj.remit = addressObj;
+
+            } else if (addressType === 'MF') {
+                obj.manufacturing.push(addressObj);
+            }
+        }
+		gs.info("Sanjay: "+JSON.stringify(obj));
+	return JSON.stringify(obj);
+    },
+
+    populateBasicSupplierInfo: function() {
+        var grVendorC = new GlideRecord('x_guklo_idot_vendor_case');
+        grVendorC.get(this.getParameter('sysparm_vendorcase'));
+        var grVendor = new GlideRecord('x_guklo_idot_vendors');
+        grVendor.get(grVendorC.vendor_name);
+        var obj = {
+            "name": grVendor.name.toString(),
+            "region": grVendor.erp_region.toString(),
+            "country": grVendor.country_code.toString(),
+            "state": grVendor.state_code.toString(),
+            "city": grVendor.city_code.toString(),
+            "address1": grVendor.address_line_1.toString(),
+            "address2": grVendor.address_line_2.toString(),
+            "address3": grVendor.address_line_3.toString(),
+            "address4": grVendor.address_line_4.toString(),
+            "zip": grVendor.zip.toString(),
+            "county_code": grVendor.county_code.toString(),
+            "duns": grVendor.duns.toString(),
+            "erp": grVendor.erp_instance.toString(),
+            "tax": grVendor.tax_id.toString(),
+            "otis_code": grVendor.otis_commodity_code.toString()
+        };
+        return JSON.stringify(obj);
+    },
+
+    populateWorkflowID: function() {
+        var vendorCase = new GlideRecord('x_guklo_idot_vendor_case');
+        vendorCase.addQuery('additional_vendor_info', 'Requested - Vendor');
+        vendorCase.addQuery('vendor_name.primary_contact', gs.getUserID());
+        vendorCase.query();
+        if (vendorCase.next()) {
+            return vendorCase.number;
+        }
+        return "";
+    },
+
+    populateVendorBasicInfo: function() {
+        var address1, address2, address3, address4, city, state, country, county, zip;
+        var grVendorC = new GlideRecord('x_guklo_idot_vendor_case');
+        grVendorC.get('number', this.getParameter('sysparm_vendorcase'));
+        var grVendor = new GlideRecord('x_guklo_idot_vendors');
+        grVendor.get(grVendorC.vendor_name);
+        var grAddress = new GlideRecord('x_guklo_idot_vendor_address')
+        grAddress.addQuery('vendor', grVendor.getUniqueValue());
+        grAddress.addQuery('address_type', 'HQ');
+        grAddress.query();
+        while (grAddress.next()) {
+            address1 = grAddress.address_line_number_1.toString();
+            address2 = grAddress.address_line_number_2.toString();
+            address3 = grAddress.address_line_number_3.toString();
+            address4 = grAddress.address_line_number_4.toString();
+            city = grAddress.city.toString();
+            state = grAddress.state.toString();
+            country = grAddress.country.toString();
+            county = grAddress.county_code.toString();
+            zip = grAddress.zip_code.toString();
+        }
+        var obj = {
+            "name": grVendor.name.toString(),
+            "erp": grVendor.erp_instance.toString(),
+            "tax": grVendor.tax_id.toString(),
+            // "request":grVendorC.request_type.toString(),
+            "address1": address1.toString(),
+            "address2": address2.toString(),
+            "address3": address3.toString(),
+            "address4": address4.toString(),
+            "state": state.toString(),
+            "city": city.toString(),
+            "country": country.toString(),
+            "zip": zip.toString(),
+            "county_code": grVendor.county_code.toString(),
+            "duns": grVendor.duns.toString(),
+        };
+        return JSON.stringify(obj);
+
+    },
+
+
+    checkSupplierMatch: function() {
+        var name = this.getParameter('sysparm_name_val');
+        var country = this.getParameter('sysparm_country_val');
+        var scode = this.getParameter('sysparm_scode_val');
+        var ccode = this.getParameter('sysparm_ccode_val');
+        var address1 = this.getParameter('sysparm_address1_val');
+        var address2 = this.getParameter('sysparm_address2_val');
+        var zip = this.getParameter('sysparm_zip_val');
+        var duns = this.getParameter('sysparm_duns_val');
+        var erp = this.getParameter('sysparm_erp_val');
+        var tax = this.getParameter('sysparm_tax_val');
+        var region = this.getParameter('sysparm_region_val');
+        var commodity = this.getParameter('sysparm_commodity_val');
+        var result = {
+            status: "NO_MATCH",
+            message: ""
+        };
+
+        // 1. FULL MATCH (all fields)
+        var grFull = new GlideRecord('x_guklo_idot_vendors');
+        grFull.addQuery('name', name);
+        grFull.addQuery('country_code', country);
+        grFull.addQuery('state_code', scode);
+        grFull.addQuery('city_code', ccode);
+        grFull.addQuery('address_line_1', address1);
+        grFull.addQuery('address_line_2', address2);
+        grFull.addQuery('zip', zip);
+        grFull.addQuery('duns', duns);
+        grFull.addQuery('erp_instance', erp);
+        grFull.addQuery('tax_id', tax);
+        grFull.addQuery('erp_region', region);
+        grFull.addQuery('otis_commodity_code', commodity);
+        grFull.query();
+        if (grFull.next()) {
+
+            result.status = "FULL_MATCH";
+            result.message = "Supplier already exists with exact details. Submission not allowed.";
+            return JSON.stringify(result);
+
+        }
+
+        // 2. Match ignoring region & country
+        var grDiffRegion = new GlideRecord('x_guklo_idot_vendors');
+        grDiffRegion.addQuery('name', name);
+        grDiffRegion.addQuery('state_code', scode);
+        grDiffRegion.addQuery('city_code', ccode);
+        grDiffRegion.addQuery('address_line_1', address1);
+        grDiffRegion.addQuery('address_line_2', address2);
+        grDiffRegion.addQuery('zip', zip);
+        grDiffRegion.addQuery('duns', duns);
+        grDiffRegion.addQuery('erp_instance', erp);
+        grDiffRegion.addQuery('tax_id', tax);
+        grDiffRegion.addQuery('otis_commodity_code', commodity);
+        grDiffRegion.query();
+        if (grDiffRegion.next()) {
+
+            result.status = "MATCH_DIFF_COUNTRY_REGION";
+            result.message = "Supplier exists with the same details but with different region/country. Do you want to continue?";
+            return JSON.stringify(result);
+
+        }
+
+        // 3. Match ignoring region, country, and commodity
+        var grDiffRegionCode = new GlideRecord('x_guklo_idot_vendors');
+        grDiffRegionCode.addQuery('name', name);
+        grDiffRegionCode.addQuery('state_code', scode);
+        grDiffRegionCode.addQuery('city_code', ccode);
+        grDiffRegionCode.addQuery('address_line_1', address1);
+        grDiffRegionCode.addQuery('address_line_2', address2);
+        grDiffRegionCode.addQuery('zip', zip);
+        grDiffRegionCode.addQuery('duns', duns);
+        grDiffRegionCode.addQuery('erp_instance', erp);
+        grDiffRegionCode.addQuery('tax_id', tax);
+        grDiffRegionCode.query();
+        if (grDiffRegionCode.next()) {
+
+            result.status = "MATCH_DIFF_REGION_CODE";
+            result.message = "Vendor has been onboarded in another country";
+            return JSON.stringify(result);
+
+        }
+
+        // No match
+        result.status = "NO_MATCH";
+        result.message = "✅ No duplicate supplier found.";
+        return JSON.stringify(result);
+
+        // var result = {
+        //     status: "NO_MATCH",
+        //     message: ""
+        // };
+
+        // var supGR = new GlideRecord('x_guklo_idot_vendors'); // change if custom table
+        // supGR.addQuery('name', name);
+        // supGR.addQuery('country_code', country);
+        // supGR.addQuery('state_code', scode);
+        // supGR.addQuery('city_code', ccode);
+        // supGR.addQuery('address_line_1', address1);
+        // supGR.addQuery('address_line_2', address2);
+        // supGR.addQuery('zip', zip);
+        // supGR.addQuery('duns', duns);
+        // supGR.addQuery('erp_instance', erp);
+        // supGR.addQuery('tax_id', tax);
+        // supGR.addQuery('erp_region', region);
+        // supGR.query();
+
+        // while (supGR.next()) {
+        //     var regionMatch = (supGR.erp_region == region);
+        //     var countryMatch = (supGR.country_code == country);
+        //     var commoditycodeMatch = (supGR.otis_commodity_code == commodity);
+
+        //     //regionMatch && countryMatch && codeMatch
+        //     if (regionMatch && countryMatch && commoditycodeMatch) {
+        //         result.status = "FULL_MATCH";
+        //         result.message = "Supplier already exists with exact details. Submission not allowed.";
+        //         return JSON.stringify(result);
+
+        //     } 
+
+
+        //     else if (!regionMatch || !countryMatch) {
+        //         if (!regionMatch && !countryMatch && !commoditycodeMatch) {
+        //             result.status = "MATCH_DIFF_REGION";
+        //             result.message = "⚠ Supplier exists with the same details but in a different region/country/code. Do you want to continue?";
+        // 			return JSON.stringify(result);
+        //         } else {
+        //             result.status = "MATCH_DIFF_COUNTRY_REGION";
+        //             result.message = "⚠ Supplier exists with the same details but in a different region/country. Do you want to continue?";
+        // 			return JSON.stringify(result);
+        //         }
+        //     }
+        // }
+
+        // return JSON.stringify(result);
+    },
+
+    puRisk: function() {
+        var sysId = this.getParameter('sysparm_sysid');
+        var gr = new GlideRecord('x_guklo_idot_vendor_case');
+        if (gr.get(sysId)) {
+            return gr.getValue('risk_result');
+        }
+        return '';
+    },
+
+    euRegion: function() {
+        var region = this.getParameter('region');
+        var countries = ['8d38b7111b121100763d91eebc0713f1', '8d38b7111b121100763d91eebc0713f0', '8d38b7111b121100763d91eebc0713ef', '8938b7111b121100763d91eebc0713f1', '8938b7111b121100763d91eebc0713ef', '8138b7111b121100763d91eebc0713f2', '8138b7111b121100763d91eebc0713f1', '8138b7111b121100763d91eebc0713f0', '8138b7111b121100763d91eebc0713ef', '8538b7111b121100763d91eebc0713f1', '8538b7111b121100763d91eebc0713f0', '8538b7111b121100763d91eebc0713ef', 'cd38b7111b121100763d91eebc0713f1', 'cd38b7111b121100763d91eebc0713ef', 'c938b7111b121100763d91eebc0713f0', 'c938b7111b121100763d91eebc0713ef', 'c138b7111b121100763d91eebc0713f2', 'c138b7111b121100763d91eebc0713f1', 'c138b7111b121100763d91eebc0713f0', 'c138b7111b121100763d91eebc0713ef', 'c538b7111b121100763d91eebc0713f1', 'c538b7111b121100763d91eebc0713f0', 'c538b7111b121100763d91eebc0713ef', '0938b7111b121100763d91eebc0713f1', '0938b7111b121100763d91eebc0713f0', '0938b7111b121100763d91eebc0713ef', '0d38b7111b121100763d91eebc0713f0', '0d38b7111b121100763d91eebc0713f1', '0138b7111b121100763d91eebc0713f2', '0138b7111b121100763d91eebc0713f1', '0538b7111b121100763d91eebc0713f2', '0538b7111b121100763d91eebc0713f1', '0538b7111b121100763d91eebc0713ef', '4d38b7111b121100763d91eebc0713f0', '4938b7111b121100763d91eebc0713f1', '4938b7111b121100763d91eebc0713f0', '4d38b7111b121100763d91eebc0713f1', '4138b7111b121100763d91eebc0713f2', '4138b7111b121100763d91eebc0713f1', '4138b7111b121100763d91eebc0713f0', '4138b7111b121100763d91eebc0713ee', '4538b7111b121100763d91eebc0713f1', '4538b7111b121100763d91eebc0713f0', '4538b7111b121100763d91eebc0713ef', '8d38b7111b121100763d91eebc0713f1'];
+        if (countries.includes(region.toString())) {
+            return 'true';
+        } else {
+            return 'false';
+        }
+    },
+
+    internalExternalCheck: function() {
+        if (gs.hasRole('snc_external'))
+            return 'external';
+        return 'internal';
+    },
+    getOTISCode: function() {
+        var cat1 = this.getParameter('sysparm_cat_1');
+        var cat2 = this.getParameter('sysparm_cat_2');
+        var cat3 = this.getParameter('sysparm_cat_3');
+        var cat4 = this.getParameter('sysparm_cat_4');
+
+        var gr = new GlideRecord('x_guklo_idot_otis_code');
+        gr.addQuery('category_l1', cat1);
+        gr.addQuery('category_l2', cat2);
+        gr.addQuery('category_l3', cat3);
+        gr.addQuery('category_l4', cat4);
+        gr.query();
+        while (gr.next()) {
+            gs.info("COMMODITY CoDE:" + gr.otis_commoditycode);
+            return gr.otis_commoditycode.toString();
+        }
+        return '';
+    },
+    getBankAccNumber: function() {
+        var task = this.getParameter('sysparm_number');
+
+        var gr = new GlideRecord('x_guklo_idot_vendor_task');
+        gr.addQuery('number', task);
+        gr.query();
+        if (gr.next()) {
+
+            return gr.bank_account_number.getDecryptedValue().toString();
+        }
+        return '';
+    },
+    getBankFromSPI: function() {
+        var spi = this.getParameter('sysparm_id');
+
+        var gr = new GlideRecord('x_guklo_idot_supplier_payment_information');
+        if (gr.get(spi)) {
+
+            return gr.bank_account_no.getDecryptedValue().toString();
+        }
+        return '';
+    },
+
+    type: 'otisAjaxUtils'
+});
