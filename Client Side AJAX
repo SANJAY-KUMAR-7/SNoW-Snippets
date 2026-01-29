@@ -1,0 +1,16 @@
+var ga = new GlideAjax("x_guklo_idot.otisBoomiIntegrationHelper");
+    ga.addParam("sysparm_name", "searchSupplier");
+    ga.addParam('sysparm_erpid', erpid);
+    ga.addParam('sysparm_region', region);
+    ga.addParam('sysparm_erpinstance', erpinstance);
+    ga.getXMLAnswer(function(response) {
+        if (response) {
+            g_form.setValue('status_supplier_id', 'completed');
+            var data = JSON.parse(response);
+            var supplier_id_check = g_form.getValue('supplier_tax_id');
+            if (supplier_id_check != data.Supplier.Tax_ID.trim()) {
+                //Validate Tax ID as a Two-Step for vendor verification
+                g_form.clearValue('fetch_exisiting_details');
+                g_form.clearValue('status_supplier_id');
+                g_form.clearValue('select_supplier_id');
+                alert("No Matching Supplier Exis
