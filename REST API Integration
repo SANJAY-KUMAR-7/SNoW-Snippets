@@ -1,0 +1,1731 @@
+var otisBoomiIntegrationHelper = Class.create();
+otisBoomiIntegrationHelper.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+
+    searchDuplicates: function() {
+        var objValues = JSON.parse(this.getParameter("sysparm_objValues"));
+        var catID = this.getParameter("sysparm_catID");
+        var grCountry = new GlideRecord('core_country');
+        grCountry.get(objValues.SupplierRequest.SourceSystemCountry.toString());
+        objValues.SupplierRequest.SourceSystemCountry = grCountry.iso3166_3.toString();
+        grCountry.get(objValues.SupplierRequest.SupplierCountry.toString());
+        objValues.SupplierRequest.SupplierCountry = grCountry.iso3166_3.toString();
+        var maxRetries = 3;
+        var success = false;
+        var responseBody = '';
+        var statusCode = '';
+        var resBody;
+        var mvrsBody = [];
+        gs.info('Boomi Search Req body ' + JSON.stringify(objValues));
+        for (var attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                var response = this.executeIntegration(JSON.stringify(objValues), "POST", gs.getProperty("x_guklo_idot.otis_boomi_search_endpoint"));
+                responseBody = response.getBody();
+                statusCode = response.getStatusCode().toString();
+                gs.info('Boomi Search Body for ' + attempt + ' - ' + responseBody);
+                if (statusCode == '200' || statusCode == '201') {
+                    success = true;
+                    resBody = JSON.parse(responseBody.replace(/\n/g, " "));
+
+                    //var mvrsBody = [];
+                    for (var i = 0; i < parseInt(resBody.SupplierResponse.GlobalSupplier.SupplierCount); i++) {
+                        var sup = resBody.SupplierResponse.GlobalSupplier.Suppliers[i];
+                        sup.SupplierCodes.forEach(function(codeObj) {
+                            if ((catID == gs.getProperty('x_guklo_idot.reactivation_req_sysid') && codeObj.SearchType == 'VX') || (catID != gs.getProperty('x_guklo_idot.reactivation_req_sysid') && codeObj.SearchType != 'VX')) {
+                                mvrsBody.push({
+                                    display_name_mrvs: sup.SupplierName,
+                                    address_mrvs: sup.AddressFull,
+                                    country_mrvs: sup.SupplierCountry,
+                                    region_mrvs: codeObj.Region,
+                                    commodity_code_mrvs: codeObj.CommodityCode,
+                                    erp_supplier_id_mrvs: codeObj.SupplierNumber,
+                                    erp_instance_mrvs: codeObj.ERPSourceSystem,
+                                    supplier_match_percentage_mrvs: sup.SupplierMatchPersentage,
+                                    address_match_percentage_mrvs: sup.AddressMatchPersentage
+                                });
+                            }
+                        });
+                    }
+                    break; // exit the retry loop
+                } else {
+                    gs.warn('Boomi API error (attempt ' + attempt + ') - Status: ' + statusCode);
+                }
+            } catch (ex) {
+                gs.error('Boomi API exception (attempt ' + attempt + ') - ' + ex.message);
+            }
+        }
+        // If all retries failed, create a case
+        if (!success) {
+            this.createIntegrationFailureCase(statusCode, responseBody, objValues);
+        }
+        var uniqueBody = Array.from(new Set(mvrsBody.map(JSON.stringify)))
+            .map(JSON.parse);
+
+        return JSON.stringify(uniqueBody);
+        //return JSON.stringify(mvrsBody);
+    },
+
+    createIntegrationFailureCase: function(statusCode, responseBody, inputPayload) {
+        var caseGR = new GlideRecord('sn_customerservice_case');
+        caseGR.initialize();
+        caseGR.short_description = 'Boomi API Failure - Supplier Search';
+        caseGR.description =
+            'API failed after 3 retries.\n\nStatus Code: ' + statusCode +
+            '\n\nResponse:\n' + responseBody +
+            '\n\nInput:\n' + inputPayload;
+        caseGR.insert();
+    },
+
+    searchSupplier: function() {
+        var erpid = this.getParameter('sysparm_erpid');
+        var region = this.getParameter('sysparm_region');
+        var erpinstance = this.getParameter('sysparm_erpinstance');
+        gs.info('search supplier client script data ' + erpid + ' ' + region + ' ' + erpinstance);
+        var payload = {
+            "SupplierRequest": {
+                "Region": region.toString(),
+                "ERPSourceSystem": erpinstance.toString(),
+                "SupplierNamber": erpid.toString()
+            }
+        };
+        gs.info('search supplier payload data ' + payload + '  ' + JSON.stringify(payload));
+
+        var maxRetries = 3;
+        var success = false;
+        //var result = {};
+        var parsed = {};
+        var responseBody = "";
+        var httpStatus = "";
+
+        for (var attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                var response = this.executeIntegration(JSON.stringify(payload), "POST", gs.getProperty("x_guklo_idot.otis_boomi_get_supplier_endpoint"));
+                responseBody = response.getBody().toString();
+                httpStatus = response.getStatusCode().toString();
+                gs.info('Search supplier Body for ' + attempt + ' - ' + responseBody + ' - ' + httpStatus);
+
+                if (httpStatus == '200' || httpStatus == '201') {
+                    success = true;
+                    parsed = JSON.parse(responseBody);
+                    gs.info("SANJAY GET:" + parsed.Supplier);
+                    if (parsed.Supplier.SupplierCount == "1" && parsed.Supplier.Status == "Success") {
+                        // if (attempt<=3 && sucess) { 
+                        gs.info('Search supplier if supplier status is success and count is 1' + parsed.Supplier.SupplierCount + ' ' + parsed.Supplier.Status);
+                        this.createSupplierPayment(parsed);
+                        this.createSupplierContact(parsed);
+                        this.createsupplierVendor(parsed, erpinstance, region);
+                        this.createWhosWhoLines(parsed);
+                        this.createSupplierAddress(parsed);
+                        break;
+                    } else if (parsed.Supplier.Status == "Failed") {
+                        gs.info('Search supplier if supplier status is failed ' + parsed.Supplier.SupplierCount + ' ' + parsed.Supplier.Status);
+                        gs.warn("Supplier API responded with failure: " +
+                            (parsed.Supplier.StatusCode + ' - ' + parsed.Supplier.Status));
+                        break;
+                    }
+
+                } else {
+                    gs.warn("Search Supplier attempt " + attempt + " failed with status " + httpStatus);
+                }
+            } catch (ex) {
+                gs.error("Search Supplier exception on attempt " + attempt + ": " + ex.message);
+            }
+        }
+
+        if (!success) {
+            try {
+                var gr = new GlideRecord('sn_customerservice_case'); // CSM case table
+                gr.initialize();
+                gr.short_description = "Search Supplier API Failure";
+                gr.description = "Failed to fetch details for payload: " + JSON.stringify(payload) +
+                    "\nLast HTTP Status: " + httpStatus +
+                    "\nResponse: " + responseBody;
+                gr.insert();
+                gs.error("Search Supplier failed after " + maxRetries + " attempts. Case created.");
+            } catch (caseEx) {
+                gs.error("Failed to create Case for Search Supplier failure: " + caseEx.message);
+            }
+            return JSON.stringify({
+                error: "API call failed after retries"
+            });
+        }
+        var grCurrency = new GlideRecord('fx_currency');
+        grCurrency.get('code', parsed.Supplier.CRRP_Currency_Code.trim());
+        if (grCurrency.isValidRecord()) {
+            parsed.currency_code_sys_id = grCurrency.getUniqueValue().toString();
+        } else {
+            parsed.currency_code_sys_id = '';
+        }
+
+        var grBu = new GlideRecord('x_guklo_idot_business_unit');
+        grBu.get('business_unit', parsed.Supplier.Business_Unit.trim());
+        if (grBu.isValidRecord()) {
+            parsed.company_code_sys_id = grBu.code.toString();
+            parsed.business_unit_sys_id = grBu.sys_id.toString();
+
+        } else {
+            parsed.company_code_sys_id = '';
+            parsed.business_unit_sys_id = '';
+
+        }
+
+        var grCountry = new GlideRecord('core_country');
+        grCountry.get('iso3166_2', parsed.Supplier.Country.trim());
+        if (grCountry.isValidRecord()) {
+            parsed.country_code_sys_id = grCountry.getUniqueValue().toString();
+        } else {
+            parsed.country_code_sys_id = '';
+        }
+
+        var grbankCountry = new GlideRecord('core_country');
+        grbankCountry.get('iso3166_2', parsed.Supplier.Banking[0].Country.trim());
+        if (grbankCountry.isValidRecord()) {
+            parsed.bank_country_code_sys_id = grbankCountry.getUniqueValue().toString();
+        } else {
+            parsed.bank_country_code_sys_id = '';
+        }
+
+        var grOtis = new GlideRecord('x_guklo_idot_otis_code');
+        grOtis.get('otis_commoditycode', parsed.Supplier.Industry_Classification_Code.trim());
+        if (grOtis.isValidRecord()) {
+            parsed.category_level_1 = grOtis.category_l1.toString() || '';
+            parsed.category_level_2 = grOtis.category_l2.toString() || '';
+            parsed.category_level_3 = grOtis.category_l3.toString() || '';
+            parsed.category_level_4 = grOtis.category_l4.toString() || '';
+        } else {
+            parsed.category_level_1 = '';
+            parsed.category_level_2 = '';
+            parsed.category_level_3 = '';
+            parsed.category_level_4 = '';
+        }
+        return JSON.stringify(parsed);
+    },
+
+    vendorCategory: function() {
+        var commoditycode = this.getParameter('sysparm_commodity');
+        var c_codes = {};
+        var occ = new GlideRecord('x_guklo_idot_otis_code');
+        occ.addQuery('otis_commoditycode', commoditycode);
+        occ.query();
+        if (occ.next()) {
+            c_codes.cat1 = occ.getValue('category_l1');
+            c_codes.cat2 = occ.getValue('category_l2');
+            c_codes.cat3 = occ.getValue('category_l3');
+            c_codes.cat4 = occ.getValue('category_l4');
+        }
+        return JSON.stringify(c_codes);
+
+    },
+    createSupplierAddress: function(obj) {
+        var count = 0;
+        var vendorCountry;
+        var countryOfVendor = new GlideRecord('core_country');
+        countryOfVendor.addEncodedQuery('iso3166_2=' + obj.Supplier.Country.trim() + '^ORiso3166_3=' + obj.Supplier.Country.trim());
+        countryOfVendor.query();
+        if (countryOfVendor.next()) {
+            vendorCountry = countryOfVendor.getUniqueValue();
+        }
+        var grVen = new GlideRecord('x_guklo_idot_vendors');
+        grVen.get('erp_supplier_id_for_new_supplier', obj.Supplier.A6_JDE_Supplier_ID.toString());
+        var grVendorAddress = new GlideRecord('x_guklo_idot_vendor_address');
+        grVendorAddress.addEncodedQuery('vendor.sys_id=' + grVen.getUniqueValue() + '^address_type=REMT^ORaddress_type=HQ');
+        grVendorAddress.query();
+        while (grVendorAddress.next()) {
+            count++;
+        }
+        if (count == 0) {
+            // NO Address in iDOT So insert a new address as HQ
+            var grCreateVendorAddress = new GlideRecord('x_guklo_idot_vendor_address');
+            grCreateVendorAddress.initialize();
+            grCreateVendorAddress.vendor = grVen.getUniqueValue();
+            grCreateVendorAddress.address_type = 'HQ';
+            grCreateVendorAddress.address_line_number_1 = obj.Supplier.Address_Line_1.trim().toString();
+            grCreateVendorAddress.address_line_number_2 = obj.Supplier.Address_Line_2.trim().toString();
+            grCreateVendorAddress.address_line_number_3 = obj.Supplier.Address_Line_3.trim().toString();
+            grCreateVendorAddress.address_line_number_4 = obj.Supplier.Address_Line_4.trim().toString();
+            grCreateVendorAddress.zip_code = obj.Supplier.Zip_Code.trim().toString();
+            grCreateVendorAddress.state = obj.Supplier.State.trim().toString();
+            grCreateVendorAddress.city = obj.Supplier.City.trim().toString();
+            grCreateVendorAddress.country = vendorCountry.toString();
+            grCreateVendorAddress.county_code = obj.Supplier.County.trim().toString();
+            grCreateVendorAddress.insert();
+            gs.info("NO ADDRESS in iDOT, Created 1 NEW ADDRESS");
+        } else if (count == 1) {
+            // HQ address in iDOT, deleting that record and creating a new HQ in sync with MDH
+            var grHQAddress = new GlideRecord('x_guklo_idot_vendor_address');
+            grHQAddress.addQuery('vendor', grVen.getUniqueValue());
+            grHQAddress.addQuery('address_type', 'HQ');
+            grHQAddress.query();
+            while (grHQAddress.next()) {
+                grHQAddress.deleteRecord();
+            }
+            var grCreateVendorAddress = new GlideRecord('x_guklo_idot_vendor_address');
+            grCreateVendorAddress.initialize();
+            grCreateVendorAddress.vendor = grVen.getUniqueValue();
+            grCreateVendorAddress.address_type = 'HQ';
+            grCreateVendorAddress.address_line_number_1 = obj.Supplier.Address_Line_1.trim().toString();
+            grCreateVendorAddress.address_line_number_2 = obj.Supplier.Address_Line_2.trim().toString();
+            grCreateVendorAddress.address_line_number_3 = obj.Supplier.Address_Line_3.trim().toString();
+            grCreateVendorAddress.address_line_number_4 = obj.Supplier.Address_Line_4.trim().toString();
+            grCreateVendorAddress.zip_code = obj.Supplier.Zip_Code.trim().toString();
+            grCreateVendorAddress.state = obj.Supplier.State.trim().toString();
+            grCreateVendorAddress.city = obj.Supplier.City.trim().toString();
+            grCreateVendorAddress.country = vendorCountry.toString();
+            grCreateVendorAddress.county_code = obj.Supplier.County.trim().toString();
+            grCreateVendorAddress.insert();
+            gs.info("HQ Address in iDOT, Updated it with MDH ADDRESS");
+        } else if (count == 2) {
+            //REMT and HQ both exist so deleting REMT and creating a new REMT in sunc with Global MDH.
+            var grHQAddress = new GlideRecord('x_guklo_idot_vendor_address');
+            grHQAddress.addQuery('vendor', grVen.getUniqueValue());
+            grHQAddress.addQuery('address_type', 'REMT');
+            grHQAddress.query();
+            while (grHQAddress.next()) {
+                grHQAddress.deleteRecord();
+            }
+            var grCreateVendorAddress = new GlideRecord('x_guklo_idot_vendor_address');
+            grCreateVendorAddress.initialize();
+            grCreateVendorAddress.vendor = grVen.getUniqueValue();
+            grCreateVendorAddress.address_type = 'REMT';
+            grCreateVendorAddress.address_line_number_1 = obj.Supplier.Address_Line_1.trim().toString();
+            grCreateVendorAddress.address_line_number_2 = obj.Supplier.Address_Line_2.trim().toString();
+            grCreateVendorAddress.address_line_number_3 = obj.Supplier.Address_Line_3.trim().toString();
+            grCreateVendorAddress.address_line_number_4 = obj.Supplier.Address_Line_4.trim().toString();
+            grCreateVendorAddress.zip_code = obj.Supplier.Zip_Code.trim().toString();
+            grCreateVendorAddress.state = obj.Supplier.State.trim().toString();
+            grCreateVendorAddress.city = obj.Supplier.City.trim().toString();
+            grCreateVendorAddress.country = vendorCountry.toString();
+            grCreateVendorAddress.county_code = obj.Supplier.County.trim().toString();
+            grCreateVendorAddress.insert();
+            gs.info("REMT Address in iDOT, Updated it with MDH ADDRESS");
+        }
+
+    },
+    createWhosWhoLines: function(obj) {
+        var grWhoLines = new GlideRecord('x_guklo_idot_vendor_whos_who_lines');
+        grWhoLines.addEncodedQuery('vendor.erp_supplier_id_for_new_supplier=' + obj.Supplier.A6_JDE_Supplier_ID.toString());
+        grWhoLines.query();
+        while (grWhoLines.next())
+            grWhoLines.deleteRecord();
+        var grVen = new GlideRecord('x_guklo_idot_vendors');
+        grVen.get('erp_supplier_id_for_new_supplier', obj.Supplier.A6_JDE_Supplier_ID.toString());
+        var whoArr = obj.Supplier.Whos_Who;
+        var phL = 0;
+        var emL = 0;
+        for (var i = 0; i < whoArr.length; i++) {
+            if (whoArr[i] != null) {
+                var phoneArr = whoArr[i].Phone;
+                var emailArr = whoArr[i].Email;
+                for (var k = 0; k < phoneArr.length; k++) {
+                    phL += 1;
+                    if (phoneArr[k] != null) {
+                        var grRec = new GlideRecord('x_guklo_idot_vendor_whos_who_lines');
+                        grRec.initialize();
+                        grRec.whos_who_line_number_id = whoArr[i].Whos_Who_Line_Number_ID.trim();
+                        grRec.professional_title = whoArr[i].Professional_Title.trim();
+                        grRec.ww_secondary_alpha_name = whoArr[i].WW_Secondary_Aplha_Name.trim();
+                        grRec.ww_alpha_name = whoArr[i].WW_Alpha_Name.trim();
+                        grRec.mailing_name = whoArr[i].Mailing_Name.trim();
+                        grRec.type_code = whoArr[i].Type_Code.trim();
+                        grRec.whos_who_type = 'Phone';
+                        grRec.line_number_id = phL.toString();
+                        grRec.line_type = phoneArr[k].Phone_Number_Type.trim();
+                        grRec.line_value = phoneArr[k].Phone_Number.trim();
+                        grRec.area_code = phoneArr[k].Phone_Area_Code1.trim();
+                        grRec.vendor = grVen.getUniqueValue();
+                        grRec.old_line_number_id = phoneArr[k].PhoneNo_LineNumber_ID.trim().toString();
+                        grRec.insert();
+                    }
+                }
+                for (var j = 0; j < emailArr.length; j++) {
+                    emL += 1;
+                    if (emailArr[j] != null) {
+                        var grRec2 = new GlideRecord('x_guklo_idot_vendor_whos_who_lines');
+                        grRec2.initialize();
+                        grRec2.whos_who_line_number_id = whoArr[i].Whos_Who_Line_Number_ID.trim();
+                        grRec2.whos_who_type = 'Email';
+                        grRec2.professional_title = whoArr[i].Professional_Title.trim();
+                        grRec2.ww_secondary_alpha_name = whoArr[i].WW_Secondary_Aplha_Name.trim();
+                        grRec2.ww_alpha_name = whoArr[i].WW_Alpha_Name.trim();
+                        grRec2.mailing_name = whoArr[i].Mailing_Name.trim();
+                        grRec2.type_code = whoArr[i].Type_Code.trim();
+                        grRec2.line_number_id = emL.toString().trim();
+                        grRec2.line_type = emailArr[j].Electronic_Address_Type.trim();
+                        grRec2.line_value = emailArr[j].Electronic_Address.trim();
+                        grRec2.vendor = grVen.getUniqueValue();
+                        grRec2.old_line_number_id = emailArr[j].Email_LineNumber_ID.trim().toString();
+                        grRec2.insert();
+                    }
+                }
+            }
+        }
+    },
+
+    createSupplierPayment: function(data) {
+        var gr = new GlideRecord('x_guklo_idot_supplier_payment_information');
+        gr.addQuery('supplier_tax_id', data.Supplier.Tax_ID.trim());
+        gr.query();
+        if (gr.next()) {
+            // gr.bank_name = data.Supplier.Banking[0].Description.trim();
+            gr.bank_account_no = data.Supplier.Banking[0].Bank_Account_No.trim();
+            gr.ap_gl_class = data.Supplier.AP_GL_Class.trim();
+            gr.tax_rate_area = data.Supplier.Tax_Rate_Area.trim();
+            gr.address_type_payables = data.Supplier.Address_Type_Payables.trim();
+            gr.factor_special_payee = data.Supplier.FactorSpecial_Payee.trim();
+            gr.otis_reporting_code_france = data.Supplier.Reporting_Code.trim();
+            gr.high_level_classification_po_nonpo_mixed = data.Supplier.Address_Book_Category_Codes_30_High_level_classifcation.trim();
+            gr.additional_tax_id = data.Supplier.Additional_Tax_ID.trim();
+            gr.ap_payment_terms = data.Supplier.AP_Payment_Terms.trim();
+            gr.tax_explanation_code = data.Supplier.Tax_Explanation_Code.trim();
+            gr.withholding_percent = data.Supplier.Withholding_Percent.trim(); //decimal value
+            gr.tax_authority_for_a_p_withholding = data.Supplier.Tax_Authority_for_AP_Withholding.trim(); //integer value
+
+            var onboard_date = data.Supplier.E_Invoice_vendor_onboarding_date.trim();
+            var f_date = onboard_date == '' ? '' : onboard_date.substring(0, 4) + '-' + onboard_date.substring(4, 6) + '-' + onboard_date.substring(6, 8);
+            gr.e_invoice_onboarding_date = f_date; //date field
+            var currencycode = new GlideRecord('fx_currency');
+            currencycode.addQuery('code', data.Supplier.CRCA_Currency_Code.trim());
+            currencycode.query();
+            if (currencycode.next()) {
+                gr.currency_code = currencycode.getUniqueValue();
+            }
+
+            gr.send_method_customer_supplier = data.Supplier.Send_Method_Customer_Supplier.trim();
+            gr.record_type = data.Supplier.Banking[0].Record_Type.trim();
+            gr.payment_instrument = data.Supplier.Payment_Instrument.trim();
+            gr.bank_transit_no = data.Supplier.Banking[0].Bank_Transit_No.trim();
+            gr.iban = data.Supplier.Banking[0].IBAN.trim();
+            gr.swift_code = data.Supplier.Banking[0].SWIFT_Code.trim();
+            gr.update();
+
+
+        } else {
+            gr.initialize();
+            gr.bank_name = data.Supplier.Banking[0].Description.trim();
+            gr.bank_account_no = data.Supplier.Banking[0].Bank_Account_No.trim();
+            gr.ap_gl_class = data.Supplier.AP_GL_Class.trim();
+            gr.supplier_tax_id = data.Supplier.Tax_ID.trim();
+            gr.tax_rate_area = data.Supplier.Tax_Rate_Area.trim();
+            gr.ap_payment_terms = data.Supplier.AP_Payment_Terms.trim();
+            gr.address_type_payables = data.Supplier.Address_Type_Payables.trim();
+            gr.factor_special_payee = data.Supplier.FactorSpecial_Payee.trim();
+            gr.additional_tax_id = data.Supplier.Additional_Tax_ID.trim();
+            gr.otis_reporting_code_france = data.Supplier.Reporting_Code.trim();
+            gr.high_level_classification_po_nonpo_mixed = data.Supplier.Address_Book_Category_Codes_30_High_level_classifcation.trim();
+            //  gr.e_invoice_flag = data.Supplier.E_Invoice_Flag.trim();
+            gr.payment_instrument = data.Supplier.Payment_Instrument.trim();
+            gr.tax_explanation_code = data.Supplier.Tax_Explanation_Code.trim();
+            gr.withholding_percent = data.Supplier.Withholding_Percent.trim(); //decimal value
+            gr.tax_authority_for_a_p_withholding = data.Supplier.Tax_Authority_for_AP_Withholding.trim(); //integer value
+
+            var onboard_date = data.Supplier.E_Invoice_vendor_onboarding_date.trim();
+            var f_date = onboard_date == '' ? '' : onboard_date.substring(0, 4) + '-' + onboard_date.substring(4, 6) + '-' + onboard_date.substring(6, 8);
+            gr.e_invoice_onboarding_date = f_date; //date field
+            var currencycode = new GlideRecord('fx_currency');
+            currencycode.addQuery('code', data.Supplier.CRCA_Currency_Code.trim());
+            currencycode.query();
+            if (currencycode.next()) {
+                gr.currency_code = currencycode.getUniqueValue();
+            }
+            gr.send_method_customer_supplier = data.Supplier.Send_Method_Customer_Supplier.trim();
+            gr.record_type = data.Supplier.Banking[0].Record_Type.trim();
+            gr.bank_transit_no = data.Supplier.Banking[0].Bank_Transit_No.trim();
+            gr.iban = data.Supplier.Banking[0].IBAN.trim();
+            gr.swift_code = data.Supplier.Banking[0].SWIFT_Code.trim();
+            gr.insert();
+        }
+
+    },
+
+
+    createSupplierContact: function(data) {
+        var contactemail, contactPhone, contactAC, contactName;
+        var whoArr = data.Supplier.Whos_Who;
+        for (var k = 0; k < whoArr.length; k++) {
+            if (whoArr[k].Whos_Who_Line_Number_ID == '0') {
+                contactName = whoArr[k].WW_Alpha_Name.trim();
+                for (var i = 0; i < whoArr[k].Email.length; i++) {
+                    var emailtype = whoArr[k].Email[i];
+                    if (emailtype != null && emailtype != '') {
+                        if (emailtype.Electronic_Address_Type == 'E') {
+                            contactemail = emailtype.Electronic_Address.trim();
+                            break;
+                        }
+                    }
+                }
+                for (var n = 0; n < whoArr[k].Phone.length; n++) {
+                    var phoneType = whoArr[k].Phone[n];
+                    if (phoneType != null && phoneType != '') {
+                        if (phoneType.Phone_Number_Type == 'TEL') {
+                            contactPhone = phoneType.Phone_Number.trim();
+                            contactAC = phoneType.Phone_Area_Code1.trim();
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+
+        }
+
+        var contactGR = new GlideRecord('x_guklo_idot_vendor_contact');
+        contactGR.addQuery('email', contactemail);
+        contactGR.query();
+        if (contactGR.next()) {
+            contactGR.name = contactName;
+            contactGR.mobile_phone = contactPhone;
+            contactGR.area_code = contactAC;
+            contactGR.historical_vendor_data = false;
+            contactGR.update();
+        } else {
+            contactGR.initialize();
+            contactGR.name = contactName;
+            contactGR.mobile_phone = contactPhone;
+            contactGR.area_code = contactAC;
+            contactGR.email = contactemail;
+            contactGR.user_name = contactemail;
+            contactGR.historical_vendor_data = true;
+            contactSysId = contactGR.insert();
+        }
+        //    var contactemail;
+        //     for (var i = 0; i < data.Supplier.Email.length; i++) {
+        //         var emailtype = data.Supplier.Email[i];
+        // 			if(emailtype != null && emailtype != ''){
+        //         if (emailtype.Electronic_Address_Type == 'E') {
+        //             contactemail = emailtype.Electronic_Address.trim();
+        // 			break;
+        //         }
+        // 			}
+        //     }
+
+        //     var contactGR = new GlideRecord('x_guklo_idot_vendor_contact');
+        //     contactGR.addQuery('email', contactemail);
+        //     contactGR.query();
+        //     //contactGR.get('email', contactemail);
+        //     if (contactGR.next()) {
+        //         //supplier name, phone ,area code ,email
+        //         contactGR.last_name = data.Supplier.AB_Alpha_Name.trim();
+        //         contactGR.user_name = data.Supplier.AB_Alpha_Name.trim();
+        //         contactGR.mobile_phone = data.Supplier.Phone[0].Phone_Number.trim();
+        //         contactGR.area_code = data.Supplier.Phone[0].Phone_Area_Code1.trim();
+        //         contactGR.update();
+        //     } else {
+        //         contactGR.initialize();
+        //         contactGR.last_name = data.Supplier.AB_Alpha_Name.trim();
+        //         contactGR.user_name = data.Supplier.AB_Alpha_Name.trim();
+        //         contactGR.mobile_phone = data.Supplier.Phone[0].Phone_Number.trim();
+        //         contactGR.area_code = data.Supplier.Phone[0].Phone_Area_Code1.trim();
+        //         contactGR.email = contactemail;
+        //         contactSysId = contactGR.insert();
+        //     }
+    },
+
+
+    createsupplierVendor: function(data, erpinstance, region) {
+        var vendorGR = new GlideRecord('x_guklo_idot_vendors');
+        vendorGR.get('erp_supplier_id_for_new_supplier', data.Supplier.A6_JDE_Supplier_ID.trim());
+        if (vendorGR.isValidRecord()) {
+            vendorGR.name = data.Supplier.AB_Alpha_Name.trim();
+            vendorGR.duns = data.Supplier.DUNS_No.trim(); //integer field
+            vendorGR.old_account_number_with_supplier = data.Supplier.Vendor_Old_Account_Number.trim();
+            vendorGR.search_type = data.Supplier.Search_Type.trim();
+            vendorGR.person_corporation_code = data.Supplier.Person_Corporation_Code.trim();
+            var commodity_codes = {};
+            var occs = new GlideRecord('x_guklo_idot_otis_code');
+            occs.addQuery('otis_commoditycode', data.Supplier.Industry_Classification_Code.trim());
+            occs.query();
+            if (occs.next()) {
+
+                commodity_codes.c1 = occs.getValue('category_l1');
+                commodity_codes.c2 = occs.getValue('category_l2');
+                commodity_codes.c3 = occs.getValue('category_l3');
+                commodity_codes.c4 = occs.getValue('category_l4');
+            }
+
+            vendorGR.category_level_1 = commodity_codes.c1;
+            vendorGR.category_level_2 = commodity_codes.c2;
+            vendorGR.category_level_3 = commodity_codes.c3;
+            vendorGR.category_level_4 = commodity_codes.c4;
+            vendorGR.erp_instance = erpinstance;
+            vendorGR.erp_region = region;
+            vendorGR.classification_code_1 = data.Supplier.E_Invoice_Flag.trim();
+            vendorGR.address_line_1 = data.Supplier.Address_Line_1.trim();
+            vendorGR.address_line_2 = data.Supplier.Address_Line_2.trim();
+            vendorGR.address_line_3 = data.Supplier.Address_Line_3.trim();
+            vendorGR.address_line_4 = data.Supplier.Address_Line_4.trim();
+            vendorGR.city_code = data.Supplier.City.trim();
+            vendorGR.zip = data.Supplier.Zip_Code.trim();
+            vendorGR.state_code = data.Supplier.State.trim();
+            vendorGR.identification_number = data.Supplier.Customer_Account_Number.trim();
+            vendorGR.obj_subject_account = data.Supplier.Deafult_Object_Account.trim();
+            vendorGR.default_subsidary_account = data.Supplier.Default_Subsidary_Account.trim();
+            vendorGR.default_expence_type = data.Supplier.Default_Expense_Type.trim();
+            vendorGR.ers_flag = data.Supplier.ERS_FLAG.trim();
+            var eff_date = data.Supplier.Beginning_Effective_Date.trim();
+            var juliandate = gs.nil(eff_date) ? "" : this.convertJulianToGeorgain(eff_date); // returns 'YYYY-MM-DD' 
+            if (juliandate) {
+                var gdt = new GlideDateTime(juliandate);
+                vendorGR.setValue('effective_date_address_creation_date', gdt.getValue());
+            }
+            vendorGR.hold_order_code = data.Supplier.Hold_Order_Code.trim();
+            var countrycode = new GlideRecord('core_country');
+            countrycode.addEncodedQuery('iso3166_2=' + data.Supplier.Country.trim() + '^ORiso3166_3=' + data.Supplier.Country.trim());
+            countrycode.query();
+            if (countrycode.next()) {
+                vendorGR.country_of_vendor = countrycode.getUniqueValue();
+            }
+            vendorGR.county_code = data.Supplier.County.trim();
+            var currencycode = new GlideRecord('fx_currency');
+            currencycode.addQuery('code', data.Supplier.CRRP_Currency_Code.trim());
+            currencycode.query();
+            if (currencycode.next()) {
+                vendorGR.invoice_currency_code = currencycode.getUniqueValue();
+            }
+
+            vendorGR.address_book_category_codes_11 = data.Supplier.Address_Book_Category_Codes_11.trim();
+            vendorGR.address_book_category_codes_15 = data.Supplier.Address_Book_Category_Codes_15.trim();
+            vendorGR.address_book_category_codes_16 = data.Supplier.Address_Book_Category_Codes_16.trim();
+            vendorGR.address_book_category_codes_17 = data.Supplier.Address_Book_Category_Codes_17.trim();
+            vendorGR.address_book_category_codes_18 = data.Supplier.Address_Book_Category_Codes_18.trim();
+            vendorGR.address_book_category_codes_19 = data.Supplier.Address_Book_Category_Codes_19.trim();
+            vendorGR.address_book_category_codes_21 = data.Supplier.Address_Book_Category_Codes_21.trim();
+            vendorGR.lines_of_business = data.Supplier.Address_Book_Category_Codes_20.trim();
+            vendorGR.rating = data.Supplier.Address_Book_Category_Codes_22.trim();
+            vendorGR.sampling = data.Supplier.Address_Book_Category_Codes_23.trim();
+            vendorGR.address_book_category_codes_24 = data.Supplier.Address_Book_Category_Codes_24.trim();
+            vendorGR.whq_quadrant_grade = data.Supplier.Address_Book_Category_Codes_14.trim();
+            vendorGR.legal_entity_name = data.Supplier.AB_Secondary_Aplha_Name.trim();
+            vendorGR.hold_payment_code = data.Supplier.Hold_Payment_Code.trim();
+            vendorGR.ims_integration_prefix_code = data.Supplier.IMS_Integration_Prefix_Code.trim();
+            vendorGR.ims_integration_sitecode = data.Supplier.IMS_Integration_Site_Code.trim();
+            var bu = new GlideRecord('x_guklo_idot_business_unit');
+            bu.addQuery('business_unit', data.Supplier.Business_Unit.trim());
+            bu.query();
+            if (bu.next()) {
+                vendorGR.business_unit = bu.getUniqueValue();
+            }
+            var vp = new GlideRecord('x_guklo_idot_supplier_payment_information');
+            vp.addQuery('supplier_tax_id', data.Supplier.Tax_ID.trim());
+            vp.query();
+            if (vp.next()) {
+                vendorGR.payment_details = vp.getUniqueValue();
+            }
+            //un comment the below code once we get the emails in response
+            var primaryemail, mailingName, proTitle, typeCode;
+            var whoArr = data.Supplier.Whos_Who;
+            for (var k = 0; k < whoArr.length; k++) {
+                if (whoArr[k].Whos_Who_Line_Number_ID == '0') {
+                    mailingName = whoArr[k].Mailing_Name.trim();
+                    proTitle = whoArr[k].Professional_Title.trim();
+                    typeCode = whoArr[k].Type_Code.trim();
+                    for (var i = 0; i < whoArr[k].Email.length; i++) {
+                        var emailtype = whoArr[k].Email[i];
+                        if (emailtype != null && emailtype != '') {
+                            if (emailtype.Electronic_Address_Type == 'E') {
+                                primaryemail = emailtype.Electronic_Address.trim();
+                            }
+                            if (emailtype.Electronic_Address_Type == 'REMT') {
+                                vendorGR.remit_to_supplier_email = emailtype.Electronic_Address.trim();
+                            }
+                            if (emailtype.Electronic_Address_Type == 'P') {
+                                vendorGR.supplier_email_to_receive_otis_po = emailtype.Electronic_Address.trim();
+                            }
+                        }
+                    }
+                    break;
+                }
+
+            }
+            vendorGR.assumed_name = mailingName;
+            vendorGR.type_code = typeCode;
+            vendorGR.professional_title = proTitle;
+            var vc = new GlideRecord('x_guklo_idot_vendor_contact');
+            vc.addQuery('email', primaryemail);
+            vc.query();
+            if (vc.next()) {
+                vendorGR.primary_contact = vc.getUniqueValue();
+            }
+
+            vendorGR.update();
+            // var primaryemail;
+            // for (var i = 0; i < data.Supplier.Email.length; i++) {
+            //     var emailtype = data.Supplier.Email[i];
+            // 	if(emailtype != null && emailtype != ''){
+            //     if (emailtype.Electronic_Address_Type == 'REMT') {
+            //         vendorGR.remit_to_supplier_email = emailtype.Electronic_Address.trim();
+            //     } else if (emailtype.Electronic_Address_Type == 'P') {
+            //         vendorGR.supplier_email_to_receive_otis_po = emailtype.Electronic_Address.trim();
+            //     }
+            // 	else if (emailtype.Electronic_Address_Type == 'E') {
+            //         primaryemail = emailtype.Electronic_Address.trim();
+            //     }
+            // 	}
+            // }
+            // var vc = new GlideRecord('x_guklo_idot_vendor_contact');
+            // //currently hardcoded the below email update it once we get the emails in response
+            // vc.addQuery('email', 'resdr@email.com');//primaryemail
+            // vc.query();
+            // if (vc.next()) {
+            //     vendorGR.primary_contact = vc.getUniqueValue();
+            // }
+
+            // vendorGR.update();
+
+        } else {
+            vendorGR.initialize();
+            vendorGR.name = data.Supplier.AB_Alpha_Name.trim();
+            vendorGR.duns = data.Supplier.DUNS_No.trim(); //integer field
+            vendorGR.erp_supplier_id_for_new_supplier = data.Supplier.A6_JDE_Supplier_ID.trim();
+            vendorGR.old_account_number_with_supplier = data.Supplier.Vendor_Old_Account_Number.trim();
+            vendorGR.tax_id = data.Supplier.Tax_ID.trim();
+            vendorGR.search_type = data.Supplier.Search_Type.trim();
+            vendorGR.person_corporation_code = data.Supplier.Person_Corporation_Code.trim();
+            var commodity_codes = {};
+            var occs = new GlideRecord('x_guklo_idot_otis_code');
+            occs.addQuery('otis_commoditycode', data.Supplier.Industry_Classification_Code.trim());
+            occs.query();
+            if (occs.next()) {
+                commodity_codes.c1 = occs.getValue('category_l1');
+                commodity_codes.c2 = occs.getValue('category_l2');
+                commodity_codes.c3 = occs.getValue('category_l3');
+                commodity_codes.c4 = occs.getValue('category_l4');
+            }
+
+            vendorGR.category_level_1 = commodity_codes.c1;
+            vendorGR.category_level_2 = commodity_codes.c2;
+            vendorGR.category_level_3 = commodity_codes.c3;
+            vendorGR.category_level_4 = commodity_codes.c4;
+            vendorGR.address_line_1 = data.Supplier.Address_Line_1.trim();
+            vendorGR.address_line_2 = data.Supplier.Address_Line_2.trim();
+            vendorGR.address_line_3 = data.Supplier.Address_Line_3.trim();
+            vendorGR.address_line_4 = data.Supplier.Address_Line_4.trim();
+            vendorGR.city_code = data.Supplier.City.trim();
+            vendorGR.erp_instance = erpinstance;
+            vendorGR.classification_code_1 = data.Supplier.E_Invoice_Flag.trim();
+            vendorGR.identification_number = data.Supplier.Customer_Account_Number.trim();
+            vendorGR.obj_subject_account = data.Supplier.Deafult_Object_Account.trim();
+            vendorGR.default_subsidary_account = data.Supplier.Default_Subsidary_Account.trim();
+            vendorGR.default_expence_type = data.Supplier.Default_Expense_Type.trim();
+            vendorGR.ers_flag = data.Supplier.ERS_FLAG.trim();
+            var eff_date = data.Supplier.Beginning_Effective_Date.trim();
+            var juliandate = gs.nil(eff_date) ? "" : this.convertJulianToGeorgain(eff_date); // returns 'YYYY-MM-DD' 
+            if (juliandate) {
+                var gdt = new GlideDateTime(juliandate);
+                vendorGR.setValue('effective_date_address_creation_date', gdt.getValue());
+            }
+            vendorGR.hold_order_code = data.Supplier.Hold_Order_Code.trim();
+            vendorGR.zip = data.Supplier.Zip_Code.trim();
+            vendorGR.state_code = data.Supplier.State.trim();
+            var countrycode = new GlideRecord('core_country');
+            countrycode.addEncodedQuery('iso3166_2=' + data.Supplier.Country.trim() + '^ORiso3166_3=' + data.Supplier.Country.trim());
+            countrycode.query();
+            if (countrycode.next()) {
+                vendorGR.country_code = countrycode.getUniqueValue();
+            }
+            vendorGR.county_code = data.Supplier.County.trim();
+            var currencycode = new GlideRecord('fx_currency');
+            currencycode.addQuery('code', data.Supplier.CRRP_Currency_Code.trim());
+            currencycode.query();
+            if (currencycode.next()) {
+                vendorGR.invoice_currency_code = currencycode.getUniqueValue();
+            }
+
+            vendorGR.address_book_category_codes_11 = data.Supplier.Address_Book_Category_Codes_11.trim();
+            vendorGR.address_book_category_codes_15 = data.Supplier.Address_Book_Category_Codes_15.trim();
+            vendorGR.address_book_category_codes_16 = data.Supplier.Address_Book_Category_Codes_16.trim();
+            vendorGR.address_book_category_codes_17 = data.Supplier.Address_Book_Category_Codes_17.trim();
+            vendorGR.address_book_category_codes_18 = data.Supplier.Address_Book_Category_Codes_18.trim();
+            vendorGR.address_book_category_codes_19 = data.Supplier.Address_Book_Category_Codes_19.trim();
+            vendorGR.address_book_category_codes_21 = data.Supplier.Address_Book_Category_Codes_21.trim();
+            vendorGR.lines_of_business = data.Supplier.Address_Book_Category_Codes_20.trim();
+            vendorGR.rating = data.Supplier.Address_Book_Category_Codes_22.trim();
+            vendorGR.sampling = data.Supplier.Address_Book_Category_Codes_23.trim();
+            vendorGR.address_book_category_codes_24 = data.Supplier.Address_Book_Category_Codes_24.trim();
+            vendorGR.whq_quadrant_grade = data.Supplier.Address_Book_Category_Codes_14.trim();
+            vendorGR.legal_entity_name = data.Supplier.AB_Secondary_Aplha_Name.trim();
+            vendorGR.ims_integration_prefix_code = data.Supplier.IMS_Integration_Prefix_Code.trim();
+            vendorGR.hold_payment_code = data.Supplier.Hold_Payment_Code.trim();
+            vendorGR.ims_integration_sitecode = data.Supplier.IMS_Integration_Site_Code.trim();
+            var bu = new GlideRecord('x_guklo_idot_business_unit');
+            bu.addQuery('business_unit', data.Supplier.Business_Unit.trim());
+            bu.query();
+            if (bu.next()) {
+                vendorGR.business_unit = bu.getUniqueValue();
+            }
+            var vp = new GlideRecord('x_guklo_idot_supplier_payment_information');
+            vp.addQuery('supplier_tax_id', data.Supplier.Tax_ID.trim());
+            vp.query();
+            if (vp.next()) {
+                vendorGR.payment_details = vp.getUniqueValue();
+            }
+            var primaryemail, mailingName, proTitle, typeCode;
+            var whoArr = data.Supplier.Whos_Who;
+            for (var k = 0; k < whoArr.length; k++) {
+                if (whoArr[k].Whos_Who_Line_Number_ID == '0') {
+                    mailingName = whoArr[k].Mailing_Name.trim();
+                    proTitle = whoArr[k].Professional_Title.trim();
+                    typeCode = whoArr[k].Type_Code.trim();
+                    for (var i = 0; i < whoArr[k].Email.length; i++) {
+                        var emailtype = whoArr[k].Email[i];
+                        if (emailtype != null && emailtype != '') {
+                            if (emailtype.Electronic_Address_Type == 'E') {
+                                primaryemail = emailtype.Electronic_Address.trim();
+                            }
+                            if (emailtype.Electronic_Address_Type == 'REMT') {
+                                vendorGR.remit_to_supplier_email = emailtype.Electronic_Address.trim();
+                            }
+                            if (emailtype.Electronic_Address_Type == 'P') {
+                                vendorGR.supplier_email_to_receive_otis_po = emailtype.Electronic_Address.trim();
+                            }
+                        }
+                    }
+                    break;
+                }
+
+            }
+            vendorGR.assumed_name = mailingName;
+            vendorGR.type_code = typeCode;
+            vendorGR.professional_title = proTitle;
+            var vc = new GlideRecord('x_guklo_idot_vendor_contact');
+            vc.addQuery('email', primaryemail);
+            vc.query();
+            if (vc.next()) {
+                vendorGR.primary_contact = vc.getUniqueValue();
+            }
+
+            // var primaryemail;
+            // for (var i = 0; i < data.Supplier.Email.length; i++) {
+            //     var emailtype = data.Supplier.Email[i];
+            // 	if(emailtype != null && emailtype != ''){
+            //     if (emailtype.Electronic_Address_Type == 'REMT') {
+            //         vendorGR.remit_to_supplier_email = emailtype.Electronic_Address.trim();
+            //     } else if (emailtype.Electronic_Address_Type == 'P') {
+            //         vendorGR.supplier_email_to_receive_otis_po = emailtype.Electronic_Address.trim();
+            //      }
+            // 	 else if (emailtype.Electronic_Address_Type == 'E') {
+            //         primaryemail = emailtype.Electronic_Address.trim();
+            //     }
+            // 	}
+            // }
+            // var vc = new GlideRecord('x_guklo_idot_vendor_contact');
+            // //currently hardcoded the below email update it once we get the emails in response
+            // vc.addQuery('email', 'resrt@email.com');//primaryemail
+            // vc.query();
+            // if (vc.next()) {
+            //     vendorGR.primary_contact = vc.getUniqueValue();
+            // }
+
+            vendorGR.insert();
+
+        }
+
+    },
+
+    searchCountry: function() {
+        var country = this.getParameter('sysparm_country');
+        var corecountry = {};
+
+        var core_country = new GlideRecord('core_country');
+        core_country.addQuery('sys_id', country);
+        core_country.query();
+        if (core_country.next()) {
+            corecountry.long = core_country.getValue('iso3166_3');
+            corecountry.short = core_country.getValue('iso3166_2');
+        }
+        return JSON.stringify(corecountry);
+
+    },
+
+    getCountrySysId: function() {
+        var countryid = this.getParameter('sysparm_bankcountry');
+
+        var cc = new GlideRecord('core_country');
+        cc.addEncodedQuery('iso3166_2=' + countryid + '^ORiso3166_3=' + countryid);
+        cc.query();
+        if (cc.next()) {
+            return cc.getUniqueValue();
+        }
+
+    },
+
+    getBusinessUnit: function() {
+        var bu_unit = this.getParameter('sysparm_business');
+        var bu = new GlideRecord('x_guklo_idot_business_unit');
+        bu.addQuery('business_unit', bu_unit);
+        bu.query();
+        if (bu.next()) {
+            return bu.getUniqueValue();
+        }
+        return '';
+    },
+
+    getCurrencyCode: function() {
+        var c_c = this.getParameter('sysparm_currency');
+        var ccode = new GlideRecord('fx_currency');
+        ccode.addQuery('code', c_c);
+        ccode.query();
+        if (ccode.next()) {
+            return ccode.getUniqueValue();
+        }
+        return '';
+    },
+
+
+    createSupplier: function(current) {
+        var body = this.getCreateRequestBody(current);
+        var response = this.executeIntegration(body, "POST", gs.getProperty("x_guklo_idot.otis_boomi_create_update_endpoint"));
+        var resBody = response.getBody();
+        var responseBody = JSON.parse(resBody.replace(/\n/g, " "));
+        gs.info('Boomi res code' + response.getStatusCode());
+        gs.info('Boomi res body ' + resBody);
+        var resObj = {};
+        var statusCode = response.getStatusCode().toString(); //Boomi Status Code
+        if (statusCode.toString() == "200" || statusCode.toString() == "201") {
+            resObj.statuscode = responseBody.Supplier.StatusCode;
+            if ("MissingFieldsList" in responseBody.Supplier)
+                resObj.message = responseBody.Supplier.Message + ' - ' + responseBody.Supplier.MissingFieldsList;
+            else
+                resObj.message = responseBody.Supplier.Message;
+            resObj.result = responseBody.Supplier.Status == 'Success' ? 'Success' : 'Failed';
+        } else {
+            resObj.statuscode = statusCode.toString();
+            resObj.message = responseBody.message;
+            resObj.result = 'Failed';
+        }
+        return JSON.stringify(resObj);
+    },
+
+    updateSupplier: function(current) {
+        var body = this.getUpdateRequestBody(current);
+        var response = this.executeIntegration(body, "POST", gs.getProperty("x_guklo_idot.otis_boomi_create_update_endpoint"));
+        var resBody = response.getBody();
+        var responseBody = JSON.parse(resBody.replace(/\n/g, " "));
+        gs.info('Boomi res code' + response.getStatusCode());
+        gs.info('Boomi res body ' + resBody);
+        var resObj = {};
+        var statusCode = response.getStatusCode().toString(); //Boomi Status Code
+        if (statusCode.toString() == "200" || statusCode.toString() == "201") {
+            resObj.statuscode = responseBody.Supplier.StatusCode;
+            resObj.message = responseBody.Supplier.Message;
+            resObj.result = responseBody.Supplier.Status == 'Success' ? 'Success' : 'Failed';
+        } else {
+            resObj.statuscode = statusCode.toString();
+            resObj.message = responseBody.message;
+            resObj.result = 'Failed';
+        }
+        return JSON.stringify(resObj);
+    },
+
+    executeIntegration: function(body, methodType, endPoint) {
+        var res = new sn_ws.RESTMessageV2();
+        res.setEndpoint(endPoint);
+        res.setHttpMethod(methodType);
+        res.setRequestHeader("Accept", "application/json");
+        res.setRequestHeader("Content-Type", "application/json");
+        res.setRequestHeader("x-api-key", gs.getProperty("x_guklo_idot.otis_boomi_dev_api_key"));
+        // res.setRequestHeader("Authorization", "Bearer " + gs.getProperty("x_guklo_idot.otis_boomi_dev_api_key"));
+        res.setRequestBody(body);
+        var response = res.execute();
+        return response;
+    },
+
+    getCreateRequestBody: function(current) {
+        var bankAccNumber = current.vendor_name.payment_details.bank_account_no.getDecryptedValue();
+        var effDate = current.vendor_name.effective_date_address_creation_date.toString() || new GlideDate();
+        var companyCode = gs.nil(current.vendor_name.company_code.toString()) ? '' : current.vendor_name.company_code.company_number.toString();
+        var sendMethod = current.vendor_name.payment_details.send_method_customer_supplier == 'print_mail' ? "" : current.vendor_name.payment_details.send_method_customer_supplier.toString();
+        var holdOrderCode = current.vendor_name.hold_order_code == 'Blank - Hold Codes 42/HC' ? "" : current.vendor_name.hold_order_code.toString();
+        var ap_payment_term = current.vendor_name.payment_details.ap_payment_terms == 'Net 30 Days' ? "" : current.vendor_name.payment_details.ap_payment_terms.toString();
+        var paymentInstrument = ["Bank Transfer", "Default (A/R & A/P)"].includes(current.vendor_name.payment_details.payment_instrument.toString()) ? "" : current.vendor_name.payment_details.payment_instrument.toString();
+        var countyCode = current.vendor_name.county_code == 'No county' ? "" : current.vendor_name.county_code.toString();
+
+
+        //Checking Which Address to Pass to JDE Remit to Main Address:
+        var vendorAddress = {};
+        var grAddress = new GlideRecord('x_guklo_idot_vendor_address');
+        grAddress.addQuery('vendor', current.vendor_name);
+        grAddress.addQuery('address_type', 'REMT');
+        grAddress.query();
+        //SENT REMIT TO ADDRESS TO JDE
+        if (grAddress.next()) {
+            vendorAddress = {
+                addressLine1: grAddress.address_line_number_1.toString(),
+                addressLine2: grAddress.address_line_number_2.toString(),
+                addressLine3: grAddress.address_line_number_3.toString(),
+                addressLine4: grAddress.address_line_number_4.toString(),
+                city: grAddress.city.toString(),
+                state: grAddress.state.toString(),
+                country: grAddress.country.iso3166_2.toString(),
+                zip: grAddress.zip_code.toString(),
+            }
+        } else {
+			//PASS MAIN ADDRESS IF REMT DOES NOT EXIST
+            grAddress.initialize();
+            var grAddress = new GlideRecord('x_guklo_idot_vendor_address');
+            grAddress.addQuery('vendor', current.vendor_name);
+            grAddress.addQuery('address_type', 'HQ');
+            grAddress.setLimit(1);
+            grAddress.query();
+            while (grAddress.next()) {
+				vendorAddress={
+                //If Remit Address Line 1 is empty we pass REMIT Address
+                addressLine1: grAddress.address_line_number_1.toString(),
+                addressLine2: grAddress.address_line_number_2.toString(),
+                addressLine3: grAddress.address_line_number_3.toString(),
+                addressLine4: grAddress.address_line_number_4.toString(),
+                city: grAddress.city.toString(),
+                state: grAddress.state.toString(),
+                country: grAddress.country.iso3166_2.toString(),
+                zip: grAddress.zip_code.toString(),
+				}
+            }
+        }
+
+        var body = {
+            "requestinfo": "A",
+            "transactionid": current.number.toString(),
+            "requestorinfo": {
+                "lob": current.vendor_name.lines_of_business.toString(), //cat 20
+            },
+            "supplierpriminfo": {
+                "erpinstance": current.vendor_name.erp_instance.toString(),
+                "sp": "N",
+                "region": current.vendor_name.erp_region.toString(),
+                "workcountry": current.vendor_name.country_code.iso3166_2.toString(),
+                "company": companyCode.toString(),
+                "erpsupplierid": "",
+                "supplierlegalname": current.vendor_name.name.toString(),
+                "suppliertaxid": current.vendor_name.tax_id.toString(),
+                "businessunit": current.vendor_name.business_unit.getDisplayValue().toString(),
+                "searchtype": current.vendor_name.search_type.toString(),
+                "corpcode": current.vendor_name.person_corporation_code.toString(),
+                "effectdate": effDate.toString(),
+                "addresstype": current.vendor_name.payment_details.address_type_payables.toString() || "Y",
+                "remark": current.vendor_name.identification_number.toString(),
+                "duns": current.vendor_name.duns.toString(),
+                "adressbookcat14": current.vendor_name.whq_quadrant_grade.toString(),
+                "adressbookcat15": current.vendor_name.address_book_category_codes_15.toString(),
+                "adressbookcat16": current.vendor_name.address_book_category_codes_16.toString(),
+                "adressbookcat17": current.vendor_name.address_book_category_codes_17.toString(),
+                "adressbookcat18": current.vendor_name.address_book_category_codes_18.toString(),
+                "adressbookcat19": current.vendor_name.address_book_category_codes_19.toString(),
+                "rating": current.vendor_name.rating.toString(), //cat 22
+                "samplingp": current.vendor_name.sampling.toString(), //cat 23
+                "adressbookcat24": current.vendor_name.address_book_category_codes_24.toString(),
+                "einvoiceonboarddate": '',
+                "classification": current.vendor_name.payment_details.high_level_classification_po_nonpo_mixed.toString() || "1", // cat 30
+                "classificationcode1": current.vendor_name.classification_code_1.toString() || "1",
+                "addressline 1": vendorAddress.addressLine1.toString(),
+                "addressline 2": vendorAddress.addressLine2.toString(),
+                "addressline 3": vendorAddress.addressLine3.toString(),
+                "addressline 4": vendorAddress.addressLine4.toString(),
+                "zipcode": vendorAddress.zip.toString(),
+                "citycode": vendorAddress.city.toString(),
+                "countrycode": vendorAddress.country.toString(),
+                "statecode": vendorAddress.state.toString(),
+                "county": countyCode.toString(),
+                "apglclass": current.vendor_name.payment_details.ap_gl_class.toString(),
+                "taxratearea": current.vendor_name.payment_details.tax_rate_area.toString(),
+                "taxexplanationcode": current.vendor_name.payment_details.tax_explanation_code.toString(),
+                "taxauthority": current.vendor_name.payment_details.tax_authority_for_a_p_withholding.toString(),
+                "wpercent": current.vendor_name.payment_details.withholding_percent.toString(),
+                "paymentinstrument": paymentInstrument.toString(),
+                "addtaxid": current.vendor_name.payment_details.additional_tax_id.toString(),
+                "alternatecharsetname": current.vendor_name.assumed_name.toString(),
+                "reportingcode": current.vendor_name.payment_details.otis_reporting_code_france.toString(),
+                "parent": current.vendor_name.parent_number.toString(),
+                "configurationdescription": "",
+                "programeid": "",
+                "userid": "",
+                "factor": "1",
+                "machinekey": "",
+                "enterpriseoneeventpoint 01": "",
+                "Integer 01": "0",
+                "Integer 02": "0",
+                "Integer 03": "0",
+                "Integer 04": "0",
+                "Integer 05": "0",
+                "dirind": "1",
+                "longaddress": "",
+                "ni": "",
+                "hrmrecords": "N",
+                "t4": "N",
+                "ct": "N",
+                "t5": "N",
+                "pt": "Y",
+                "c5": "N",
+                "em": "N",
+                "specialpayee": current.vendor_name.payment_details.factor_special_payee.toString(),
+                "catcode1": "",
+                "actrep": "",
+                "catcode3": "",
+                "georeg": "",
+                "catcode5": "",
+                "catcode6": "",
+                "catcode9": "",
+                "catcode10": "",
+                "catcode21": current.vendor_name.commodity_code.toString() || '',
+                "catcode27": "",
+                "catcode28": "",
+                "catcode29": current.vendor_name.ims_integration_sitecode.toString(),
+                "catcode30": current.vendor_name.payment_details.high_level_classification_po_nonpo_mixed.toString() || "1",
+                "salreg": current.vendor_name.address_book_category_codes_11.toString(),
+                "ac": "Y",
+                "alternativemailingname": current.vendor_name.assumed_name.toString() || current.vendor_name.name.toString(),
+                "phonenumber": current.vendor_name.phone.toString(),
+                "phonetype": "TEL",
+                "numberofemployees": "",
+                "growthrate": "0",
+                "integer 01": "0",
+                "integer in02": "0",
+                "integer in03": "0",
+                "integer in04": "0",
+                "integer in05": "0",
+                "integer in06": "0",
+                "objacct": "",
+                "subsidiaryac": "",
+                "docco": "",
+                "documentnumber": "",
+                "doty": "",
+                "currencycode": current.vendor_name.invoice_currency_code.getDisplayValue().toString(),
+                "hp": current.vendor_name.hold_payment_code.toString(),
+                "multpmts": "",
+                "pricepl": "",
+                "ledgrseq": "",
+                "addressbookamount": "",
+                "hdcd": holdOrderCode.toString(),
+                "deliveryinstructions": "",
+                "deliveryinstructions2": "",
+                "minchk": "",
+                "rn": "",
+                "transtype": "JDEAB",
+                "trac": "A",
+                "displaysequence": "1",
+                "mailingname": current.vendor_name.assumed_name.toString() || current.vendor_name.name.toString(),
+                "professionaltitle": "",
+                "givenname": current.vendor_name.primary_contact.name.toString(),
+                "middlename": "",
+                "typecode": "C",
+                "contacttype": "",
+                "dayofbirth": "",
+                "monthofbirth": "",
+                "yearofbirth": "",
+                "functioncode": "",
+                "preferredcontactmethod": "",
+                "primarycontact": "",
+                "accountid": "",
+                "lineid": "0",
+                "linenumber": "1",
+                "pn": "",
+                "phone": [{
+                    "number": current.vendor_name.primary_contact.mobile_phone.toString(),
+                    "type": "TEL",
+                    "linenumber": "1",
+                    "lineid": "0",
+                    "areacode": current.vendor_name.primary_contact.area_code.toString() || "+1",
+                    "genericnumber1": "0"
+                }],
+                "email": [],
+            },
+            "reportingdata": {
+                "appaymentterms": ap_payment_term.toString(),
+            },
+            "category": {
+                "industryclass": current.vendor_name.otis_commodity_code.toString(),
+                "commoditycode": current.vendor_name.commodity_code.toString() || '', // cat 21
+                "otiscommoditycode": "",
+            },
+            "banking": [{
+                "currency": current.vendor_name.payment_details.currency_code.getDisplayValue().toString() || current.vendor_name.invoice_currency_code.getDisplayValue().toString(),
+                "accntno": bankAccNumber.toString(),
+                "iban": current.vendor_name.payment_details.iban.toString(),
+                "swiftcode": current.vendor_name.payment_details.swift_code.toString(),
+                "bcc": current.vendor_name.payment_details.bank_country_code.iso3166_2.toString(),
+                "recordtype": "V", //set as V
+                "smethod": sendMethod.toString(),
+                "banktrnasit": current.vendor_name.payment_details.bank_transit_no.toString(),
+                "bankrefname": current.vendor_name.payment_details.bank_name.toString(),
+                "sdtl": "",
+                "addressnumberbank": "",
+                "enterpriseoneeventpoint01": "A",
+                "customerbankaccountno": bankAccNumber.toString(),
+                "linenumber": "1"
+            }],
+            "additionalinfo": {
+                "continent": current.vendor_name.ims_integration_prefix_code.toString()
+            }
+        };
+        var lineNum = 0;
+        if (current.vendor_name.primary_contact.email.toString() != '') {
+            lineNum += 1;
+            body.supplierpriminfo.email.push({
+                "email": current.vendor_name.primary_contact.email.toString(),
+                "type": "E",
+                "linenumber": lineNum.toString(),
+                "lineid": "0",
+                "messageindcator": "0",
+                "genericnumber": "0"
+            });
+        }
+        if (current.vendor_name.remit_to_supplier_email != '') {
+            lineNum += 1;
+            body.supplierpriminfo.email.push({
+                "email": current.vendor_name.remit_to_supplier_email.toString(),
+                "type": "REMT",
+                "linenumber": lineNum.toString(),
+                "lineid": "0",
+                "messageindcator": "0",
+                "genericnumber": "0"
+            });
+        }
+        if (current.vendor_name.supplier_email_to_receive_otis_po != '') {
+            lineNum += 1;
+            body.supplierpriminfo.email.push({
+                "email": current.vendor_name.supplier_email_to_receive_otis_po.toString(),
+                "type": "P",
+                "linenumber": lineNum.toString(),
+                "lineid": "0",
+                "messageindcator": "0",
+                "genericnumber": "0"
+            });
+        }
+        gs.info('Boomi Req Body ' + JSON.stringify(body));
+        return JSON.stringify(body);
+    },
+
+    getUpdateRequestBody: function(current) {
+        var bankAccNumber = current.vendor_name.payment_details.bank_account_no.getDecryptedValue();
+        var effDate = current.vendor_name.effective_date_address_creation_date.toString() || current.vendor_name.payment_details.e_invoice_onboarding_date.toString() || new GlideDate();
+        var companyCode = gs.nil(current.vendor_name.company_code.toString()) ? '' : current.vendor_name.company_code.company_number.toString();
+        var sendMethod = current.vendor_name.payment_details.send_method_customer_supplier == 'print_mail' ? "" : current.vendor_name.payment_details.send_method_customer_supplier.toString();
+        var holdOrderCode = current.vendor_name.hold_order_code == 'Blank - Hold Codes 42/HC' ? "" : current.vendor_name.hold_order_code.toString();
+        var ap_payment_term = current.vendor_name.payment_details.ap_payment_terms == 'Net 30 Days' ? "" : current.vendor_name.payment_details.ap_payment_terms.toString();
+        var paymentInstrument = ["Bank Transfer", "Default (A/R & A/P)"].includes(current.vendor_name.payment_details.payment_instrument.toString()) ? "" : current.vendor_name.payment_details.payment_instrument.toString();
+        var countyCode = current.vendor_name.county_code == 'No county' ? "" : current.vendor_name.county_code.toString();
+        var body = {
+            "requestinfo": "C",
+            "transactionid": current.number.toString(),
+            "requestorinfo": {
+                "lob": current.vendor_name.lines_of_business.toString(), //cat 20
+            },
+            "supplierpriminfo": {
+                "erpinstance": current.vendor_name.erp_instance.toString(),
+                "sp": "N",
+                "region": current.vendor_name.erp_region.toString(),
+                "workcountry": current.vendor_name.country_code.iso3166_2.toString(),
+                "company": companyCode.toString(),
+                "erpsupplierid": current.vendor_name.erp_supplier_id_for_new_supplier.toString(),
+                "supplierlegalname": current.vendor_name.name.toString(),
+                "suppliertaxid": current.vendor_name.tax_id.toString(),
+                "businessunit": current.vendor_name.business_unit.getDisplayValue().toString(),
+                "searchtype": current.vendor_name.search_type.toString(),
+                "corpcode": current.vendor_name.person_corporation_code.toString(),
+                "effectdate": effDate.toString(),
+                "addresstype": current.vendor_name.payment_details.address_type_payables.toString() || "Y",
+                "remark": current.vendor_name.identification_number.toString(),
+                "duns": current.vendor_name.duns.toString(),
+                "adressbookcat14": current.vendor_name.whq_quadrant_grade.toString(),
+                "adressbookcat15": current.vendor_name.address_book_category_codes_15.toString(),
+                "adressbookcat16": current.vendor_name.address_book_category_codes_16.toString(),
+                "adressbookcat17": current.vendor_name.address_book_category_codes_17.toString(),
+                "adressbookcat18": current.vendor_name.address_book_category_codes_18.toString(),
+                "adressbookcat19": current.vendor_name.address_book_category_codes_19.toString(),
+                "rating": current.vendor_name.rating.toString(), //cat 22
+                "samplingp": current.vendor_name.sampling.toString(), //cat 23
+                "adressbookcat24": current.vendor_name.address_book_category_codes_24.toString(),
+                "einvoiceonboarddate": '',
+                "classification": current.vendor_name.payment_details.high_level_classification_po_nonpo_mixed.toString() || "1", // cat 30
+                "classificationcode1": current.vendor_name.classification_code_1.toString() || "1",
+                "addressline 1": current.vendor_name.address_line_1.toString(),
+                "addressline 2": current.vendor_name.address_line_2.toString(),
+                "addressline 3": current.vendor_name.address_line_3.toString() || current.vendor_name.address_line_2.toString(),
+                "addressline 4": current.vendor_name.address_line_4.toString() || current.vendor_name.address_line_2.toString(),
+                "zipcode": current.vendor_name.zip.toString(),
+                "citycode": current.vendor_name.city_code.toString(),
+                "countrycode": current.vendor_name.country_of_vendor.iso3166_2.toString(),
+                "statecode": current.vendor_name.state_code.toString(),
+                "county": countyCode.toString(),
+                "apglclass": current.vendor_name.payment_details.ap_gl_class.toString(),
+                "taxratearea": current.vendor_name.payment_details.tax_rate_area.toString(),
+                "taxexplanationcode": current.vendor_name.payment_details.tax_explanation_code.toString(),
+                "taxauthority": current.vendor_name.payment_details.tax_authority_for_a_p_withholding.toString(),
+                "wpercent": current.vendor_name.payment_details.withholding_percent.toString(),
+                "paymentinstrument": paymentInstrument.toString(),
+                "addtaxid": current.vendor_name.payment_details.additional_tax_id.toString(),
+                "alternatecharsetname": current.vendor_name.assumed_name.toString(),
+                "reportingcode": current.vendor_name.payment_details.otis_reporting_code_france.toString(),
+                "parent": current.vendor_name.parent_number.toString(),
+                "configurationdescription": "",
+                "programeid": "",
+                "userid": "",
+                "factor": "1",
+                "machinekey": "",
+                "enterpriseoneeventpoint 01": "",
+                "Integer 01": "0",
+                "Integer 02": "0",
+                "Integer 03": "0",
+                "Integer 04": "0",
+                "Integer 05": "0",
+                "dirind": "1",
+                "longaddress": "",
+                "ni": "",
+                "hrmrecords": "N",
+                "t4": "N",
+                "ct": "N",
+                "t5": "N",
+                "pt": "Y",
+                "c5": "N",
+                "em": "N",
+                "specialpayee": current.vendor_name.payment_details.factor_special_payee.toString(),
+                "catcode1": "",
+                "actrep": "",
+                "catcode3": "",
+                "georeg": "",
+                "catcode5": "",
+                "catcode6": current.vendor_name.payment_details.address_type_payables.toString() || '',
+                "catcode9": "",
+                "catcode10": "",
+                "catcode21": current.vendor_name.commodity_code.toString() || '',
+                "catcode27": "",
+                "catcode28": "",
+                "catcode29": current.vendor_name.ims_integration_sitecode.toString(),
+                "catcode30": current.vendor_name.payment_details.high_level_classification_po_nonpo_mixed.toString() || "1",
+                "salreg": current.vendor_name.address_book_category_codes_11.toString(),
+                "ac": "Y",
+                "alternativemailingname": current.vendor_name.assumed_name.toString() || current.vendor_name.name.toString(),
+                "numberofemployees": "",
+                "growthrate": "0",
+                "integer 01": "0",
+                "integer in02": "0",
+                "integer in03": "0",
+                "integer in04": "0",
+                "integer in05": "0",
+                "integer in06": "0",
+                "objacct": "",
+                "subsidiaryac": "",
+                "docco": "",
+                "documentnumber": "",
+                "doty": "",
+                "currencycode": current.vendor_name.invoice_currency_code.getDisplayValue().toString(),
+                "hp": current.vendor_name.hold_payment_code.toString(),
+                "multpmts": "",
+                "pricepl": "",
+                "ledgrseq": "",
+                "addressbookamount": "",
+                "hdcd": holdOrderCode.toString(),
+                "deliveryinstructions": "",
+                "deliveryinstructions2": "",
+                "minchk": "",
+                "rn": "",
+                "transtype": "JDEAB", // Always JDEAB
+                "trac": "A",
+                "displaysequence": "1",
+                "functioncode": "",
+                "preferredcontactmethod": "",
+                "accountid": "",
+                "linenumber": "1"
+            },
+            "reportingdata": {
+                "appaymentterms": ap_payment_term.toString(),
+            },
+            "category": {
+                "industryclass": current.vendor_name.otis_commodity_code.toString(),
+                "commoditycode": current.vendor_name.commodity_code.toString() || '', // cat 21
+                "otiscommoditycode": "",
+            },
+            "Whos_Who": [],
+            "banking": [{
+                "currency": current.vendor_name.payment_details.currency_code.getDisplayValue().toString() || current.vendor_name.invoice_currency_code.getDisplayValue().toString(),
+                "accntno": bankAccNumber.toString(),
+                "iban": current.vendor_name.payment_details.iban.toString(),
+                "swiftcode": current.vendor_name.payment_details.swift_code.toString(),
+                "bcc": current.vendor_name.payment_details.bank_country_code.iso3166_2.toString(),
+                "recordtype": "V", //set as V
+                "smethod": sendMethod.toString(),
+                "banktrnasit": current.vendor_name.payment_details.bank_transit_no.toString(),
+                "bankrefname": current.vendor_name.payment_details.bank_name.toString(),
+                "sdtl": "",
+                "addressnumberbank": "",
+                "enterpriseoneeventpoint01": "A",
+                "customerbankaccountno": bankAccNumber.toString(),
+                "linenumber": "1"
+            }],
+            "additionalinfo": {
+                "continent": current.vendor_name.ims_integration_prefix_code.toString()
+            }
+        };
+        var gr = new GlideAggregate('x_guklo_idot_vendor_whos_who_lines');
+        gr.addAggregate('COUNT', 'whos_who_line_number_id');
+        gr.addEncodedQuery('vendor=' + current.vendor_name);
+        gr.query();
+        while (gr.next()) {
+            var firstloop = true;
+            var gr1 = new GlideRecord('x_guklo_idot_vendor_whos_who_lines');
+            gr1.addEncodedQuery('vendor=' + current.vendor_name + '^whos_who_line_number_id=' + gr.whos_who_line_number_id);
+            gr1.query();
+            while (gr1.next()) {
+                if (firstloop) {
+                    var obj = {
+                        "lineid": gr1.whos_who_line_number_id.toString(),
+                        "mailingname": gr1.mailing_name.toString(),
+                        "professionaltitle": gr1.professional_title.toString(),
+                        "WW_Alpha_Name": gr1.ww_alpha_name.toString(),
+                        "WW_Secondary_Alpha_Name": gr1.ww_secondary_alpha_name.toString(),
+                        "typecode": gr1.type_code.toString(),
+                        "phone": [],
+                        "email": []
+                    };
+                }
+                firstloop = false;
+                if (gr1.whos_who_type == 'Phone') {
+                    obj.phone.push({
+                        "linenumber": gr1.line_number_id.toString(),
+                        "type": gr1.line_type.toString(),
+                        "areacode": gr1.area_code.toString(),
+                        "number": gr1.line_value.toString(),
+                        "erplinenumber": gr1.old_line_number_id.toString()
+                    });
+                } else if (gr1.whos_who_type == 'Email') {
+                    obj.email.push({
+                        "linenumber": gr1.line_number_id.toString(),
+                        "type": gr1.line_type.toString(),
+                        "email": gr1.line_value.toString(),
+                        "erplinenumber": gr1.old_line_number_id.toString()
+                    });
+                }
+            }
+            body.Whos_Who.push(obj);
+        }
+        gs.info('Boomi Req Body Update ' + JSON.stringify(body));
+        return JSON.stringify(body);
+    },
+
+    convertGeorgianToJulian: function(gDate) {
+        var date;
+        if (typeof gDate === 'string') {
+            var parts = gDate.split('-');
+            var year = parseInt(parts[0], 10);
+            var month = parseInt(parts[1], 10) - 1;
+            var day = parseInt(parts[2], 10);
+            date = new Date(year, month, day);
+        } else if (gDate instanceof Date) {
+            date = gDate;
+        }
+        var fullYear = date.getFullYear();
+        var centuryCode;
+        if (fullYear >= 2000) {
+            centuryCode = 1;
+        } else {
+            centuryCode = 0;
+        }
+        var yearInCentury = fullYear % 100;
+        var startOfYear = new Date(fullYear, 0, 1);
+        var diffInTime = date.getTime() - startOfYear.getTime();
+        var diffInDays = diffInTime / (1000 * 60 * 60 * 24);
+        var dayOfYear = Math.floor(diffInDays) + 1;
+        var formattedYear = String(yearInCentury).padStart(2, '0');
+        var formattedDay = String(dayOfYear).padStart(3, '0');
+
+        return centuryCode + formattedYear + formattedDay;
+    },
+
+    convertJulianToGeorgain: function(julianDate) {
+        var julianString = String(julianDate);
+        var paddedJulian = julianString.padStart(6, '0');
+        var centuryChar = paddedJulian.substring(0, 1);
+        var yearInCentury = paddedJulian.substring(1, 3);
+        var dayOfYear = paddedJulian.substring(3, 6);
+        var year;
+        if (centuryChar === '0') {
+            year = 1900 + parseInt(yearInCentury, 10);
+        } else if (centuryChar === '1') {
+            year = 2000 + parseInt(yearInCentury, 10);
+        }
+        var date = new Date(year, 0);
+        date.setDate(dayOfYear);
+        var month = (date.getMonth() + 1).toString().padStart(2, '0');
+        var day = date.getDate().toString().padStart(2, '0');
+
+        return year + '-' + month + '-' + day;
+    },
+
+    convertJulianAjax: function() {
+        var jul = this.getParameter('sysparm_julian');
+        return this.convertJulianToGeorgain(jul); // returns string 'YYYY-MM-DD'
+    },
+
+
+    getSamplePayload: function() {
+        var obj = {
+            "Supplier": {
+                "A6_JDE_Supplier_ID": "60955656789",
+                "Vendor_Old_Account_Number": "",
+                "Tax_ID": "134924710",
+                "AB_Alpha_Name": "AT&T",
+                "Business_Unit": "153153510",
+                "Industry_Classification_Code": "843223",
+                "Search_Type": "V",
+                "Person_Corporation_Code": "1",
+                "Address_Type_Payables": "Y",
+                "Beginning_Effective_Date": "118183",
+                "FactorSpecial_Payee": "60955656",
+                "Reporting_Code": "1",
+                "Address_Book_Category_Codes_11": "",
+                "Address_Book_Category_Codes_14": "C",
+                "Address_Book_Category_Codes_15": "",
+                "Address_Book_Category_Codes_16": "UTL",
+                "Address_Book_Category_Codes_17": "01",
+                "Address_Book_Category_Codes_18": "CP",
+                "Address_Book_Category_Codes_19": "OT",
+                "Address_Book_Category_Codes_20": "100",
+                "Address_Book_Category_Codes_21": "001",
+                "Address_Book_Category_Codes_22": "",
+                "Address_Book_Category_Codes_23": "",
+                "Address_Book_Category_Codes_24": "",
+                "IMS_Integration_Prefix_Code": "",
+                "IMS_Integration_Site_Code": "",
+                "Address_Book_Category_Codes_30_High_level_classifcation": "",
+                "Customer_Account_Number": "057 317-7684 001",
+                "Additional_Tax_ID": "0001234574",
+                "AB_Secondary_Aplha_Name": "",
+                "DUNS_No": "12345",
+                "E_Invoice_Flag": "true",
+                "E_Invoice_vendor_onboarding_date": "2025206",
+                "AP_GL_Class": "TRAD",
+                "Deafult_Object_Account": "703060",
+                "Default_Subsidary_Account": "0001",
+                "Default_Expense_Type": "",
+                "CRRP_Currency_Code": "USD",
+                "Tax_Rate_Area": "TXTX",
+                "Tax_Explanation_Code": "V",
+                "Hold_Payment_Code": "N",
+                "Tax_Authority_for_AP_Withholding": "0.0",
+                "Withholding_Percent": "0.0",
+                "AP_Payment_Terms": "PX1",
+                "Payment_Instrument": "X",
+                "CRCA_Currency_Code": "USD",
+                "Hold_Order_Code": "42",
+                "Send_Method_Customer_Supplier": "",
+                "ERS_FLAG": "N",
+                "Address_Line_1": "Collections Center Dr",
+                "Address_Line_2": "812939 Terminal Dr B Terminal",
+                "Address_Line_3": "ATTN: V.P OF ENGINEERING",
+                "Address_Line_4": "P.O. Box 7517",
+                "Zip_Code": "30348",
+                "City": "ATLANTA",
+                "Country": "US",
+                "State": "GA",
+                "County": "FULTON",
+                "Whos_Who": [{
+                        "Whos_Who_Line_Number_ID": "0",
+                        "Mailing_Name": "AT&T",
+                        "Professional_Title": "",
+                        "WW_Alpha_Name": "AT&T",
+                        "WW_Secondary_Aplha_Name": "AT&T",
+                        "Type_Code": "C",
+                        "Phone": [{
+                                "PhoneNo_LineNumber_ID": "1",
+                                "Phone_Number_Type": "TEL",
+                                "Phone_Area_Code1": "",
+                                "Phone_Number": "9181291"
+                            },
+                            {
+
+                                "PhoneNo_LineNumber_ID": "2",
+                                "Phone_Number_Type": "OFF",
+                                "Phone_Area_Code1": "",
+                                "Phone_Number": "121111"
+                            },
+                            {
+
+                                "PhoneNo_LineNumber_ID": "3",
+                                "Phone_Number_Type": "CCR",
+                                "Phone_Area_Code1": "",
+                                "Phone_Number": "918191"
+                            },
+                            {
+                                "PhoneNo_LineNumber_ID": "4",
+                                "Phone_Number_Type": "HOM",
+                                "Phone_Area_Code1": "",
+                                "Phone_Number": "91901"
+                            }
+                        ],
+                        "Email": [{
+                                "Email_LineNumber_ID": "1",
+                                "Electronic_Address_Type": "E",
+                                "Electronic_Address": "TESt1@GBS.COM"
+                            },
+                            {
+                                "Email_LineNumber_ID": "2",
+                                "Electronic_Address_Type": "REMT",
+                                "Electronic_Address": "TESt2@GBS.COM"
+                            },
+                            {
+                                "Email_LineNumber_ID": "3",
+                                "Electronic_Address_Type": "PO",
+                                "Electronic_Address": "TESt3@GBS.COM"
+                            },
+                            {
+                                "Email_LineNumber_ID": "4",
+                                "Electronic_Address_Type": "R",
+                                "Electronic_Address": "TESt4@GBS.COM"
+                            },
+                            {
+                                "Email_LineNumber_ID": "5",
+                                "Electronic_Address_Type": "HELP",
+                                "Electronic_Address": "TESt5@GBS.COM"
+                            },
+                            {
+                                "Email_LineNumber_ID": "6",
+                                "Electronic_Address_Type": "S",
+                                "Electronic_Address": "TESt6@GBS.COM"
+                            }
+                        ]
+                    },
+                    {
+                        "Whos_Who_Line_Number_ID": "1",
+                        "Mailing_Name": "AT& T- TEST1",
+                        "Professional_Title": "",
+                        "WW_Alpha_Name": "AT& T- TEST1",
+                        "WW_Secondary_Aplha_Name": "AT& T- TEST1",
+                        "Type_Code": "E",
+                        "Phone": [{
+
+                                "PhoneNo_LineNumber_ID": "1",
+                                "Phone_Number_Type": "OFF",
+                                "Phone_Area_Code1": "",
+                                "Phone_Number": "11111"
+                            },
+                            {
+
+                                "PhoneNo_LineNumber_ID": "2",
+                                "Phone_Number_Type": "CAR",
+                                "Phone_Area_Code1": "",
+                                "Phone_Number": "2222"
+                            },
+                            {
+
+                                "PhoneNo_LineNumber_ID": "3",
+                                "Phone_Number_Type": "STMT",
+                                "Phone_Area_Code1": "",
+                                "Phone_Number": "3333"
+                            }
+                        ],
+                        "Email": [{
+                                "Email_LineNumber_ID": "1",
+                                "Electronic_Address_Type": "I",
+                                "Electronic_Address": "1212@ABC.COM"
+                            },
+                            {
+                                "Email_LineNumber_ID": "2",
+                                "Electronic_Address_Type": "P",
+                                "Electronic_Address": "12917@AB.COM"
+                            },
+                            {
+                                "Email_LineNumber_ID": "3",
+                                "Electronic_Address_Type": "CPAY",
+                                "Electronic_Address": "12121@GABA.COM"
+                            }
+                        ]
+                    },
+                    {
+                        "Whos_Who_Line_Number_ID": "2",
+                        "Mailing_Name": "AT& T- TEST2",
+                        "Professional_Title": "",
+                        "WW_Alpha_Name": "AT& T- TEST2",
+                        "WW_Secondary_Aplha_Name": "AT& T- TEST2",
+                        "Type_Code": "P",
+                        "Phone": [{
+                                "PhoneNo_LineNumber_ID": "1",
+                                "Phone_Number_Type": "OFF",
+                                "Phone_Area_Code1": "91",
+                                "Phone_Number": "uyaua"
+                            },
+                            {
+
+                                "PhoneNo_LineNumber_ID": "2",
+                                "Phone_Number_Type": "FAX",
+                                "Phone_Area_Code1": "+8171",
+                                "Phone_Number": "817181"
+                            }
+                        ],
+                        "Email": [{
+                                "Email_LineNumber_ID": "1",
+                                "Electronic_Address_Type": "I",
+                                "Electronic_Address": "TESt1@HG"
+                            },
+                            {
+                                "Email_LineNumber_ID": "2",
+                                "Electronic_Address_Type": "HELP",
+                                "Electronic_Address": "TESt2@HG"
+                            }
+                        ]
+                    }
+                ],
+                "Banking": [{
+                    "Record_Type": "V",
+                    "Bank_Transit_No": "021000021",
+                    "Bank_Account_No": "323076769",
+                    "Description": "JPMorgan Chase New York",
+                    "SWIFT_Code": "BOFAUS3N",
+                    "Country": "US",
+                    "IBAN": "US12668890416672849"
+                }],
+                "SupplierCount": "1",
+                "StatusCode": "200",
+                "Status": "Success"
+            }
+        };
+        var grCurrency = new GlideRecord('fx_currency');
+        grCurrency.get('code', obj.Supplier.CRRP_Currency_Code.trim());
+        if (grCurrency.isValidRecord()) {
+            obj.currency_code_sys_id = grCurrency.getUniqueValue().toString();
+        } else {
+            obj.currency_code_sys_id = '';
+        }
+
+        var grBu = new GlideRecord('x_guklo_idot_business_unit');
+        grBu.get('business_unit', obj.Supplier.Business_Unit.trim());
+        if (grBu.isValidRecord()) {
+            obj.company_code_sys_id = grBu.code.toString();
+            obj.business_unit_sys_id = grBu.sys_id.toString();
+
+        } else {
+            obj.company_code_sys_id = '';
+            obj.business_unit_sys_id = '';
+
+        }
+
+        var grCountry = new GlideRecord('core_country');
+        grCountry.get('iso3166_2', obj.Supplier.Country.trim());
+        if (grCountry.isValidRecord()) {
+            obj.country_code_sys_id = grCountry.getUniqueValue().toString();
+        } else {
+            obj.country_code_sys_id = '';
+        }
+
+        var grbankCountry = new GlideRecord('core_country');
+        grbankCountry.get('iso3166_2', obj.Supplier.Banking[0].Country.trim());
+        if (grbankCountry.isValidRecord()) {
+            obj.bank_country_code_sys_id = grbankCountry.getUniqueValue().toString();
+        } else {
+            obj.bank_country_code_sys_id = '';
+        }
+
+        var grOtis = new GlideRecord('x_guklo_idot_otis_code');
+        grOtis.get('otis_commoditycode', obj.Supplier.Industry_Classification_Code.trim());
+        if (grOtis.isValidRecord()) {
+            obj.category_level_1 = grOtis.category_l1.toString() || '';
+            obj.category_level_2 = grOtis.category_l2.toString() || '';
+            obj.category_level_3 = grOtis.category_l3.toString() || '';
+            obj.category_level_4 = grOtis.category_l4.toString() || '';
+        } else {
+            obj.category_level_1 = '';
+            obj.category_level_2 = '';
+            obj.category_level_3 = '';
+            obj.category_level_4 = '';
+        }
+
+        return JSON.stringify(obj);
+    },
+    type: 'otisBoomiIntegrationHelper'
+});
