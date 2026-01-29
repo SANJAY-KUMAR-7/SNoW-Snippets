@@ -1,0 +1,107 @@
+var mcDInboundActionHelper = Class.create();
+mcDInboundActionHelper.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+
+    createCaseConditions: function(current, event, email, logger, classifier) {
+        return this.isValidMailbox('u_active=true^u_mailboxIN' + email.recipients.toString() + '^u_mailboxISNOTEMPTY');
+    },
+
+    forwardCaseConditions: function(current, event, email, logger, classifier) {
+        return this.isValidMailbox('u_active=true^u_mailboxIN' + email.recipients.toString() + '^u_mailboxISNOTEMPTY');
+    },
+
+    isValidMailbox: function(query) {
+        var grcasemapping = new GlideRecord('sn_customerservice_csm_case_mapping');
+        grcasemapping.addEncodedQuery(query);
+        grcasemapping.query();
+        if (grcasemapping.hasNext())
+            return true;
+        else
+            return false;
+    },
+
+	forwardCaseConditionsCora : function(current, event, email, logger, classifier) {
+           return this.isValidMailbox('u_active=true^u_mailbox=' + email.from.toString() + '^u_mailboxISNOTEMPTY');
+	},
+
+   createCaseActionCora : function(current, event, email, logger, classifier) {
+     targetFrom = this.createCase(current, email, email.from.toString(), 'from', 'false');
+   },
+
+    createCaseAction: function(current, event, email, logger, classifier) {
+        var targetRecTo = this.createCase(current, email, email.direct.toString(), 'to', 'false');
+        var targetRecCC;
+        if (!gs.nil(targetRecTo)) {
+            var grCase = new GlideRecord('sn_customerservice_case');
+            grCase.initialize();
+            targetRecCC = this.createCase(grCase, email, email.copied.toString(), 'cc', targetRecTo);
+        } else
+            targetRecCC = this.createCase(current, email, email.copied.toString(), 'cc', targetRecTo);
+        if (!gs.nil(targetRecTo) && !gs.nil(targetRecCC)) {
+            var now = new GlideDateTime();
+            now.addSeconds(10);
+            gs.eventQueueScheduled('sn_customerservice.inboundCopyAttachment', current, targetRecTo.toString(), targetRecCC.toString(), now);
+        }
+    },
+
+    createCase: function(current, email, recipients, address, targetRecTo) {
+		var recID = '', mailboxes = recipients.split(',');
+	for(var k=0; k<mailboxes.length; k++){
+        var grcasemapping = new GlideRecord('sn_customerservice_csm_case_mapping');
+        grcasemapping.addEncodedQuery('u_active=true^u_mailbox=' + mailboxes[k] + '^u_mailboxISNOTEMPTY');
+        grcasemapping.query();
+        if (grcasemapping.next()) {
+            current.contact_type = 'email';
+            current.u_process = grcasemapping.u_process;
+            current.u_region = grcasemapping.u_region;
+            current.u_country = grcasemapping.u_country;
+			current.u_category2= grcasemapping.u_category;
+            current.category = grcasemapping.u_case_type;
+            current.subcategory = grcasemapping.u_case_sub_type;
+            current.priority = grcasemapping.u_priority;
+            current.assignment_group = grcasemapping.u_assignment_group;
+            current.short_description = email.subject;
+            current.u_description = email.body_html; // HTML
+			current.description = email.body_text; // Updated by MH : body text
+			current.u_from_mailbox = grcasemapping.u_mailbox;
+			if(address == 'from'){
+				var userEmail = this.getReqEmailFrom(current, email, recipients, address, targetRecTo);
+                current.u_requester_email = userEmail.trim();
+			}
+			else{
+            current.internal_user = email.from_sys_id;
+            current.u_requester_email = email.from.toString(); 
+			}
+            if (address == 'cc') {
+                if (!gs.nil(targetRecTo)) {
+                    current.number = global.getNextObjNumberPadded();
+                    current.parent = targetRecTo;
+                }
+				else
+                   current.u_sub_state = 'place_holder';
+            }
+            recID = current.insert();
+			break;
+        }
+	}
+        return recID;
+    },
+
+	getReqEmailFrom : function(current, email, recipients, address, targetRecTo){
+		    var userEmail;
+			var emailBody = email.body_text || email.body_html;
+            var fromLines = emailBody.match(/From:\s*.*<.*@.*>|From:\s*.*@.*$/gm);
+             if (fromLines && fromLines.length > 0) {
+                       var lastLine = fromLines[fromLines.length - 1];
+                       var emailMatch = lastLine.match(/<([^>]+)>|([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+                if (emailMatch) {
+                        userEmail =  emailMatch[1] || emailMatch[2];
+                            }
+                }
+				if(userEmail.indexOf('<mailto:') != -1){
+					userEmail = userEmail.substring(0,userEmail.indexOf('<mailto:'));
+				}
+				return userEmail;
+	},
+
+    type: 'mcDInboundActionHelper'
+});
